@@ -32,7 +32,17 @@ if [[ -f "${SCRIPT_DIR}/jeehelp.sh" ]]; then
 else
     echo "Téléchargement de jeehelp.sh depuis GitHub..."
     tmp_file="$(mktemp)"
-    if ! curl -fsSL "${REPO_RAW_URL}" -o "${tmp_file}"; then
+    if command -v curl >/dev/null 2>&1; then
+        download_ok=0
+        curl -fsSL "${REPO_RAW_URL}" -o "${tmp_file}" && download_ok=1
+    elif command -v wget >/dev/null 2>&1; then
+        download_ok=0
+        wget -qO "${tmp_file}" "${REPO_RAW_URL}" && download_ok=1
+    else
+        echo "Ni curl ni wget n'est disponible sur ce système." >&2
+        exit 1
+    fi
+    if [[ "${download_ok}" -ne 1 ]]; then
         echo "Échec du téléchargement depuis ${REPO_RAW_URL}" >&2
         exit 1
     fi

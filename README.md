@@ -6,10 +6,16 @@ Navigation interactive : ↑↓ sélection, ENTRÉE valider, ÉCHAP retour, CTRL
 
 ## Installation
 
-Sur la box Jeedom, en une commande :
+Sur la box Jeedom, en une commande (avec `curl`, présent par défaut sur Jeedom) :
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/limad/jeehelp/beta/install.sh | sudo bash
+```
+
+Ou avec `wget` si `curl` n'est pas disponible :
+
+```bash
+wget -qO- https://raw.githubusercontent.com/limad/jeehelp/beta/install.sh | sudo bash
 ```
 
 Cela installe la commande `jeehelp` dans `/usr/local/bin/jeehelp`.
