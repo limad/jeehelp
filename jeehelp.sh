@@ -1691,6 +1691,17 @@ generate_report() {
             else _r_item err "${label}" "HTTP ${code}"; fi
         done
     done
+    # Adresse externe configurée dans Jeedom (DNS Jeedom, domaine perso, tunnel...)
+    local ext; ext=$(_jee_php 'echo network::getNetworkAccess("external");' 2>/dev/null | tail -1)
+    if [[ "${ext}" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[^[:space:]]*)?$ ]]; then
+        res=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 10 "${ext%/}/index.php?v=d" 2>/dev/null)
+        code="${res%% *}"; tm="${res##* }"
+        if   [[ "${code}" == "200" || "${code}" == "302" ]]; then _r_item ok "Adresse externe ${ext}" "HTTP ${code} (${tm}s)"
+        elif [[ -z "${code}" || "${code}" == "000" ]]; then _r_item warn "Adresse externe ${ext}" "injoignable depuis la box (timeout 10 s)"
+        else _r_item warn "Adresse externe ${ext}" "HTTP ${code}"; fi
+    else
+        _r_item info "Adresse externe" "non configurée dans Jeedom"
+    fi
 
     # ── Plugins actifs, daemons et dépendances ──
     _r_sec "Plugins actifs"
