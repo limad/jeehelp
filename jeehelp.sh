@@ -18,7 +18,7 @@ readonly CONF_FILE="${JEEDOM_DIR}/core/config/common.config.php"
 readonly CORE_INC="${JEEDOM_DIR}/core/php/core.inc.php"
 readonly JEECRON="${JEEDOM_DIR}/core/php/jeeCron.php"
 readonly AUDIT_LOG="/var/log/jeedom-menu.log"
-readonly MAX_BACKUPS=7
+readonly MAX_BACKUPS=3
 
 # ── Couleurs ─────────────────────────────────────────────────
 R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m'
