@@ -383,7 +383,7 @@ show_system_info() {
     section "Watchdog"
     _watchdog_check
     section "Certificat SSL local"
-    _ssl_check "$(hostname -f 2>/dev/null || hostname)"
+    _ssl_check_auto
     pause
 }
 
@@ -405,24 +405,58 @@ _watchdog_check() {
 }
 
 # Même convention de retour que _watchdog_check (0=OK, 1=anomalie).
+# Hôtes dont on teste le certificat : le nom local, l'adresse externe configurée dans Jeedom
+# (service DNS Jeedom *.jeedom.link, nom de domaine perso...) et le nom HTTPS de Tailscale quand
+# il est actif. Ces accès terminent le TLS ailleurs : Apache local n'a alors aucun certificat et le
+# seul test du nom d'hôte signalait à tort « HTTPS non détecté ».
+_ssl_targets() {
+    {
+        hostname -f 2>/dev/null || hostname
+        local ext; ext=$(_jee_php 'echo network::getNetworkAccess("external");' 2>/dev/null | tail -1)
+        if [[ "${ext}" =~ ^https://([A-Za-z0-9.-]+)(:[0-9]+)?(/.*)?$ ]]; then
+            local eh="${BASH_REMATCH[1]}"
+            [[ "${eh}" =~ ^[0-9.]+$ || "${eh}" == localhost ]] || echo "${eh}"
+        fi
+        if command -v tailscale &>/dev/null; then
+            timeout 5 tailscale status --json 2>/dev/null | php -r '
+                $j = json_decode(stream_get_contents(STDIN), true);
+                $d = rtrim((string)($j["Self"]["DNSName"] ?? ""), ".");
+                if (($j["BackendState"] ?? "") === "Running" && $d !== "") echo $d . "\n";'
+        fi
+    } | awk 'NF && !seen[$0]++'
+}
+
+_ssl_expiry() {  # hôte → date d'expiration (vide si pas de TLS sur :443) ; délai borné
+    echo | timeout 10 openssl s_client -connect "$1:443" -servername "$1" 2>/dev/null \
+        | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2
+}
+
 _ssl_check() {
     local domain="${1:-$(hostname -f)}"
     command -v openssl &>/dev/null || { echo -e "  ${Y}openssl non disponible${N}"; return 1; }
-    local expiry
-    # timeout explicite : un pare-feu qui droppe sans répondre bloquerait
-    # sinon s_client indéfiniment (pas de timeout par défaut côté openssl).
-    expiry=$(echo | timeout 10 openssl s_client -connect "${domain}:443" \
-             -servername "${domain}" 2>/dev/null \
-             | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+    local expiry; expiry=$(_ssl_expiry "${domain}")
     if [[ -z "$expiry" ]]; then
-        echo -e "  ${Y}Pas de HTTPS détecté sur ${domain}${N}"; return 0  # info : une box LAN sans HTTPS n'est pas une anomalie
+        echo -e "  ${Y}Pas de HTTPS détecté sur ${domain}${N}"; return 0
     fi
     local diff_days; diff_days=$(( ($(date -d "$expiry" +%s 2>/dev/null) - $(date +%s)) / 86400 ))
     if [[ $diff_days -le 14 ]]; then
-        echo -e "  ${R}⚠  SSL expire dans ${diff_days}j (${expiry})${N}"; return 1
+        echo -e "  ${R}⚠  SSL ${domain} expire dans ${diff_days}j (${expiry})${N}"; return 1
     fi
-    echo -e "  ${G}✔${N} SSL valide encore ${diff_days} jours"
+    echo -e "  ${G}✔${N} SSL ${domain} valide encore ${diff_days} jours"
     return 0
+}
+
+# Teste tous les hôtes connus ; "pas de HTTPS" n'est une anomalie pour aucun (réseau local possible)
+_ssl_check_auto() {
+    command -v openssl &>/dev/null || { echo -e "  ${Y}openssl non disponible${N}"; return 1; }
+    local h found=0 rc=0 tested=()
+    while IFS= read -r h; do
+        [[ -z "${h}" ]] && continue
+        tested+=("${h}")
+        if [[ -n "$(_ssl_expiry "${h}")" ]]; then _ssl_check "${h}" || rc=1; found=1; fi
+    done < <(_ssl_targets)
+    [[ ${found} -eq 0 ]] && echo -e "  ${Y}Pas de HTTPS détecté (hôtes testés : ${tested[*]})${N}"
+    return ${rc}
 }
 
 # ============================================================
@@ -607,20 +641,20 @@ show_health() {
         || _chk "http.error" ok   "${err_count} lignes"
 
     # ── SSL ──
-    local domain; domain=$(hostname -f 2>/dev/null || hostname)
     command -v openssl &>/dev/null && {
-        local expiry
-        expiry=$(echo | timeout 10 openssl s_client -connect "${domain}:443" \
-                 -servername "${domain}" 2>/dev/null \
-                 | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
-        if [[ -z "$expiry" ]]; then
-            _chk "SSL ${domain}" warn "HTTPS non détecté"
-        else
-            local diff_days; diff_days=$(( ($(date -d "$expiry" +%s) - $(date +%s)) / 86400 ))
-            [[ $diff_days -le 14 ]] \
-                && _chk "SSL" warn "expire dans ${diff_days}j" \
-                || _chk "SSL" ok   "valide ${diff_days}j"
-        fi
+        local ssl_host ssl_exp ssl_days ssl_found=0 ssl_tested=()
+        while IFS= read -r ssl_host; do
+            [[ -z "${ssl_host}" ]] && continue
+            ssl_tested+=("${ssl_host}")
+            ssl_exp=$(_ssl_expiry "${ssl_host}")
+            [[ -z "${ssl_exp}" ]] && continue
+            ssl_found=1
+            ssl_days=$(( ($(date -d "${ssl_exp}" +%s) - $(date +%s)) / 86400 ))
+            [[ ${ssl_days} -le 14 ]] \
+                && _chk "SSL ${ssl_host}" warn "expire dans ${ssl_days}j" \
+                || _chk "SSL ${ssl_host}" ok   "valide ${ssl_days}j"
+        done < <(_ssl_targets)
+        [[ ${ssl_found} -eq 0 ]] && _chk "SSL" warn "HTTPS non détecté (testé : ${ssl_tested[*]})"
     }
 
     # ── Noyau / mises à jour apt ──
@@ -2376,7 +2410,7 @@ cli_mode() {
             echo "[CLI] Vérification système..."
             _H_OK=0; _H_WARN=0; _H_ERR=0
             _watchdog_check; local wd_rc=$?
-            _ssl_check "$(hostname -f 2>/dev/null || hostname)"; local ssl_rc=$?
+            _ssl_check_auto; local ssl_rc=$?
             [[ ${wd_rc} -ne 0 || ${ssl_rc} -ne 0 ]] && rc=1 ;;
         --health)
             echo "[CLI] Health check complet..."
