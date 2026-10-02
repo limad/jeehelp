@@ -54,6 +54,7 @@ message d'erreur si lancé sans `sudo`) et détecte Jeedom dans `/var/www/html`.
 | 🌐 Réseau & SSL | Interfaces réseau, test de connectivité internet, ports en écoute, connexions actives, ping, vérification SSL d'un domaine |
 | 🔄 Mises à jour & sécurité | Vérifier/appliquer les mises à jour Jeedom, `apt update && upgrade`, configuration `unattended-upgrades` (reboot nocturne auto si patch noyau), dry-run et statut |
 | 🧹 Nettoyage | Purge des vieilles sauvegardes, nettoyage de `/tmp` (avec aperçu et confirmation), analyse de l'espace disque, vidage de l'OPcache PHP, `apt autoremove` |
+| 📝 Rapport de diagnostic | Document unique mettant en évidence tout ce qui peut justifier un blocage : état du core (cron, scénarios, démarrage, date), contrôles de la page Santé, accessibilité de l'interface et de la page de secours, plugins actifs avec état des daemons et dépendances, MariaDB (connexions, taille), ressources (disque, inodes, mémoire, swap, OOM), services et unités en échec, erreurs fatales PHP par plugin, messages Jeedom, sauvegardes, droits, réseau, mises à jour, actions récentes de jeehelp. Synthèse des erreurs/avertissements en tête ; enregistré dans `log/jeehelp_rapport_<date>.txt` (10 derniers conservés), sans secret |
 | 🆘 Mode secours | Pour quand l'interface web de Jeedom (y compris sa propre page de secours `index.php?v=d&p=database&rescue=1`) est injoignable. Teste l'accès à cette page web, et reproduit en CLI ses deux actions clés : désactiver tous les plugins, activer/désactiver le système cron. Actions journalisées dans `log/jeehelp_rescue.log` (visible depuis Jeedom une fois l'interface de nouveau accessible) en plus du journal d'audit |
 
 ### Mode CLI (non-interactif)
@@ -63,6 +64,7 @@ sudo jeehelp --backup            # Lancer une sauvegarde Jeedom
 sudo jeehelp --repair-db         # REPAIR TABLE sur toutes les tables
 sudo jeehelp --check             # Vérification rapide (watchdog + SSL)
 sudo jeehelp --health            # Health check complet (équivalent au menu "Santé")
+sudo jeehelp --report            # Rapport de diagnostic complet (code retour : 0 OK, 1 avertissement, 2 erreur)
 sudo jeehelp --fix-perms         # Rétablir les droits fichiers de /var/www/html
 sudo jeehelp --upgrade-security  # Lancer unattended-upgrade immédiatement
 ```
