@@ -15,7 +15,8 @@ readonly JEEDOM_DIR="/var/www/html"
 readonly BACKUP_DIR="${JEEDOM_DIR}/backup"
 readonly LOG_DIR="${JEEDOM_DIR}/log"
 readonly CONF_FILE="${JEEDOM_DIR}/core/config/common.config.php"
-readonly PHP_CLI="php ${JEEDOM_DIR}/core/php/jeedom.php"
+readonly CORE_INC="${JEEDOM_DIR}/core/php/core.inc.php"
+readonly JEECRON="${JEEDOM_DIR}/core/php/jeeCron.php"
 readonly AUDIT_LOG="/var/log/jeedom-menu.log"
 readonly MAX_BACKUPS=7
 
@@ -262,6 +263,35 @@ svc_ctl() {
         || echo -e "${R}✘ Erreur ${svc} ${action}${N}"
 }
 
+# ── API PHP Jeedom (remplace l'ancien jeedom.php, absent depuis 4.6) ────
+#  jeedom.php n'existe plus : seul core/php/jeecli.php subsiste, et il ne
+#  couvre que plugin/user/message/backup-restore-list (voir son code), pas
+#  backup-create, clearCache, cron start/stop ni update/doUpdate. Pour ces
+#  actions on appelle donc directement les classes core via `php -r`,
+#  exécuté en www-data (comme /etc/cron.d/jeedom) pour ne jamais créer de
+#  fichiers appartenant à root sous ${JEEDOM_DIR}.
+_jee_php() {
+    sudo -u www-data php -r "require '${CORE_INC}'; $1" 2>&1
+}
+
+#  Variante permettant de passer une valeur dynamique (ex: chemin de backup)
+#  via l'environnement plutôt que de l'interpoler dans le code PHP — évite
+#  tout souci d'échappement si la valeur contient guillemets/espaces.
+_jee_php_env() {
+    local envassign="$1" code="$2"
+    sudo -u www-data env "${envassign}" php -r "require '${CORE_INC}'; ${code}" 2>&1
+}
+
+#  État du master jeeCron — remplace pgrep -f "jeedom.php" (fichier
+#  inexistant en 4.6, donc le pgrep ne matchait jamais). Réplique exactement
+#  la détection native cron::jeeCronRun() (lit le PID dans
+#  jeedom::getTmpFolder().'/jeeCron.pid' et vérifie que le process est
+#  vivant via posix_getsid), telle qu'utilisée par core/php/jeeCron.php
+#  lui-même avant de devenir master.
+_daemon_running() {
+    sudo -u www-data php -r "require '${CORE_INC}'; exit(cron::jeeCronRun() ? 0 : 1);" 2>/dev/null
+}
+
 check_root()   { [[ $EUID -ne 0 ]] && { echo -e "${R}Lancer en root (sudo).${N}"; exit 1; }; }
 check_jeedom() { [[ ! -f "${CONF_FILE}" ]] && { echo -e "${R}Jeedom non détecté dans ${JEEDOM_DIR}${N}"; exit 1; }; }
 
@@ -306,7 +336,7 @@ show_system_info() {
 }
 
 _watchdog_check() {
-    pgrep -f "jeedom.php" > /dev/null 2>&1 \
+    _daemon_running \
         && echo -e "  ${G}✔${N} Daemon Jeedom actif" \
         || echo -e "  ${R}✘${N} Daemon Jeedom introuvable"
     local pct; pct=$(df "${JEEDOM_DIR}" | awk 'NR==2{gsub(/%/,""); print $5}')
@@ -387,7 +417,7 @@ show_health() {
     done
 
     # ── Daemon Jeedom ──
-    pgrep -f "jeedom.php" &>/dev/null \
+    _daemon_running \
         && _chk "Daemon Jeedom" ok "actif" \
         || _chk "Daemon Jeedom" err "introuvable"
 
@@ -606,7 +636,9 @@ _backup_list() {
 _backup_create() {
     header; section "Création sauvegarde"
     echo -e "${Y}En cours...${N}"
-    ${PHP_CLI} action=backup 2>&1
+    # jeedom::backup(false) exécute install/backup.php de façon synchrone
+    # (même appel que celui fait par l'ancien jeedom.php action=backup).
+    _jee_php 'jeedom::backup(false);'
     if [[ $? -eq 0 ]]; then
         local latest; latest=$(ls -t "${BACKUP_DIR}"/*.tar.gz 2>/dev/null | head -1)
         echo -e "${G}✔ $(basename "${latest}")${N}"
@@ -624,7 +656,10 @@ _backup_restore() {
     echo -e "${R}⚠  Cette opération écrasera la configuration actuelle !${N}"
     confirm "Restaurer $(basename "${PICKED_FILE}")" || { echo -e "${Y}Annulé.${N}"; pause; return; }
     echo
-    ${PHP_CLI} action=restore backup="${PICKED_FILE}" 2>&1
+    # jeedom::restore(..., false) = synchrone, même appel que l'ancien
+    # jeedom.php action=restore. Chemin passé via l'environnement (pas
+    # d'interpolation dans le code PHP).
+    _jee_php_env "JEE_BACKUP_PATH=${PICKED_FILE}" 'jeedom::restore(getenv("JEE_BACKUP_PATH"), false);'
     [[ $? -eq 0 ]] \
         && { echo -e "${G}✔ Restauration terminée.${N}"; log_action "RESTORE: ${PICKED_FILE}"; } \
         || echo -e "${R}✘ Erreur lors de la restauration${N}"
@@ -770,9 +805,14 @@ _db_import() {
 
 _db_flush_cache() {
     header; section "Cache Jeedom"
-    ${PHP_CLI} action=clearCache 2>&1
-    echo -e "${G}✔ Cache vidé.${N}"
-    log_action "Cache Jeedom vidé"
+    # cache::flush() = action exacte de l'ajax core cache.ajax.php?action=flush.
+    _jee_php 'cache::flush();'
+    if [[ $? -eq 0 ]]; then
+        echo -e "${G}✔ Cache vidé.${N}"
+        log_action "Cache Jeedom vidé"
+    else
+        echo -e "${R}✘ Erreur lors du vidage du cache.${N}"
+    fi
     pause
 }
 
@@ -799,13 +839,11 @@ menu_services() {
                for s in apache2 nginx; do svc_ctl restart "$s"; done; pause ;;
             2) header; section "Redémarrage MySQL/MariaDB"
                for s in mysql mariadb; do svc_ctl restart "$s"; done; pause ;;
-            3) header; section "Redémarrage daemon Jeedom"
-               ${PHP_CLI} action=stopCron 2>&1; sleep 2
-               ${PHP_CLI} action=startCron 2>&1
-               echo -e "${G}✔ Daemon relancé.${N}"; log_action "Daemon Jeedom restart"; pause ;;
+            3) _svc_restart_daemon ;;
             4) header
                confirm "Relancer Jeedom complet" \
-                   && { ${PHP_CLI} action=restart 2>&1; log_action "Jeedom restart"; echo -e "${G}✔${N}"; } \
+                   && { _jee_php 'jeedom::stop(); sleep(2); jeedom::start();'
+                        log_action "Jeedom restart (stop+start)"; echo -e "${G}✔${N}"; } \
                    || echo -e "${Y}Annulé.${N}"
                pause ;;
             5) _server_reboot ;;
@@ -822,6 +860,38 @@ _svc_status() {
             && echo -e "  ${G}● ACTIF ${N} ${svc}" \
             || echo -e "  ${R}● ${st^^}${N}  ${svc}"
     done
+    pause
+}
+
+#  Redémarre uniquement le master jeeCron (sans toucher enableCron/
+#  enableScenario, contrairement à jeedom::stop()+start() utilisé pour le
+#  "Relancer Jeedom complet"). Reproduit ce que fait jeedom::stop() pour la
+#  partie cron (kill du PID via system::kill, cf. jeedom.class.php) puis
+#  relance une exécution ponctuelle de jeeCron.php : comme /etc/cron.d/jeedom
+#  le fait chaque minute, ce process devient le nouveau master s'il n'y en a
+#  pas déjà un (cron::jeeCronRun()), cf. core/php/jeeCron.php.
+_svc_restart_daemon() {
+    header; section "Redémarrage daemon Jeedom (cron master)"
+    _jee_php '
+        if (cron::jeeCronRun()) {
+            echo "Arret du master en cours (pid " . cron::getPidFile() . ")...\n";
+            system::kill(cron::getPidFile());
+        } else {
+            echo "Aucun master actif.\n";
+        }
+    '
+    sleep 1
+    echo -e "${Y}Relance...${N}"
+    sudo -u www-data setsid php "${JEECRON}" > /dev/null 2>&1 < /dev/null &
+    disown
+    sleep 2
+    if _daemon_running; then
+        echo -e "${G}✔ Daemon relancé.${N}"
+        log_action "Daemon Jeedom (cron master) restart OK"
+    else
+        echo -e "${R}✘ Le daemon ne semble pas être reparti.${N}"
+        log_action "Daemon Jeedom (cron master) restart ÉCHEC"
+    fi
     pause
 }
 
@@ -943,10 +1013,27 @@ menu_updates() {
         nav_menu "Mises à jour & Sécurité" "${opts[@]}"
         case $MENU_RESULT in
             -1|6) return ;;
-            0) header; ${PHP_CLI} action=update 2>&1; pause ;;
+            0) header; section "Vérification des mises à jour"
+               # update::checkAllUpdate() + refreshUpdateMessage() = action
+               # exacte de l'ajax core update.ajax.php?action=checkAllUpdate.
+               _jee_php '
+                   update::checkAllUpdate();
+                   update::refreshUpdateMessage();
+                   $u = update::byLogicalId("jeedom");
+                   if (is_object($u)) {
+                       echo "Jeedom core — version locale   : " . $u->getLocalVersion() . "\n";
+                       echo "Jeedom core — version distante : " . $u->getRemoteVersion() . "\n";
+                   }
+                   echo "Elements necessitant une mise a jour (plugins+core) : " . update::nbNeedUpdate() . "\n";
+               '
+               pause ;;
             1) header
                confirm "Mettre à jour Jeedom" \
-                   && { ${PHP_CLI} action=doUpdate 2>&1; log_action "Jeedom doUpdate"; } \
+                   && { echo -e "${Y}Lancement en tâche de fond (voir Logs > update)...${N}"
+                        # jeedom::update() = ce que fait $update->doUpdate()
+                        # pour un update de type 'core' (cf. update.class.php).
+                        _jee_php 'jeedom::update();'
+                        log_action "Jeedom doUpdate (core, via jeedom::update)"; } \
                    || echo -e "${Y}Annulé.${N}"
                pause ;;
             2) header; section "apt update + upgrade"
@@ -1219,7 +1306,7 @@ cli_mode() {
     case "$1" in
         --backup)
             echo "[CLI] Sauvegarde..."
-            ${PHP_CLI} action=backup 2>&1
+            _jee_php 'jeedom::backup(false);'
             rc=$?
             log_action "CLI --backup (rc=${rc})" ;;
         --repair-db)
