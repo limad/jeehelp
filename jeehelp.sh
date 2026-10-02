@@ -83,7 +83,7 @@ section()    { echo -e "\n${C}── $1 ─────────────�
 header() {
     clear
     echo -e "${B}╔══════════════════════════════════════════════════════╗${N}"
-    echo -e "${B}║${W}        🏠  JEEDOM — Menu d'administration           ${B}║${N}"
+    echo -e "${B}║${W}        🏠  JEEDOM — Helper by Limad44                ${B}║${N}"
     echo -e "${B}╚══════════════════════════════════════════════════════╝${N}"
     echo
 }
