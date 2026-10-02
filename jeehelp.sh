@@ -820,9 +820,15 @@ _db_all_tables() {
         # backticks : sans ça, un nom de table contenant ` casserait la
         # requête générée (injection SQL de second ordre).
         tbl_escaped="${tbl//\`/\`\`}"
-        res=$(mysql_cmd -N -e "${cmd} TABLE \`${tbl_escaped}\`;" | awk '{print $NF}')
+        # Sortie MySQL : Table, Op, Msg_type, Msg_text (séparés par tab).
+        # Anomalie = ligne "error", ou statut "Operation failed" ; les notes
+        # (ex: moteur MEMORY qui ne supporte pas analyze) et "already up to
+        # date" sont normaux. Sortie vide = requête échouée.
+        local out; out=$(mysql_cmd -N -e "${cmd} TABLE \`${tbl_escaped}\`;")
+        res=$(awk -F'\t' '{ if ($3=="error" || ($3=="status" && $4=="Operation failed")) bad=1; last=$4 }
+                         END { if (last=="") bad=1; printf "%s", (bad ? "ERREUR : " : "") (last=="" ? "pas de réponse" : last) }' <<< "${out}")
         printf "  %-35s %s\n" "${tbl}" "${res}"
-        [[ "${res}" == "OK" || "${res}" == "status" ]] || failed=1
+        [[ "${res}" == ERREUR* ]] && failed=1
     done
 
     if [[ $failed -eq 0 ]]; then
