@@ -441,6 +441,15 @@ _chk() {
     esac
 }
 
+# Compte les fichiers proches du datadir par défaut qui n'appartiennent pas
+# à mysql. Ce contrôle borné reste léger et ne suit pas les autres systèmes
+# de fichiers montés sous le répertoire.
+_mysql_datadir_bad_owner_count() {
+    local dir="$1"
+    [[ -d "$dir" ]] || { echo 0; return 0; }
+    find "$dir" -xdev -maxdepth 2 -type f ! -user mysql ! -name 'debian-*.flag' ! -name mariadb_upgrade_info -printf . 2>/dev/null | wc -c
+}
+
 show_health() {
     local mode="${1:-interactive}"
     [[ "$mode" == "interactive" ]] && header
@@ -458,12 +467,28 @@ show_health() {
         _chk "PHP" err "non détecté"
     fi
 
-    # ── MariaDB connexion ──
+    # ── MariaDB : distinguer serveur joignable, base sélectionnée et schéma ──
     load_mysql_creds
-    if mysql_cmd -e "SELECT 1;" &>/dev/null; then
-        _chk "MariaDB" ok "connecté (${DB_NAME})"
+    if mysql --defaults-extra-file="${DB_OPTFILE}" -N -e "SELECT 1;" &>/dev/null; then
+        _chk "MariaDB" ok "serveur joignable"
+        if mysql_cmd -e "SELECT 1;" &>/dev/null; then
+            _chk "Base Jeedom" ok "connectée (${DB_NAME})"
+            local schema_tables schema_rc
+            schema_tables=$(mysql_cmd -N -e "SHOW TABLES;"); schema_rc=$?
+            if [[ ${schema_rc} -ne 0 ]]; then
+                _chk "Schéma Jeedom" err "impossible d'énumérer les tables"
+            elif [[ -z "${schema_tables}" ]]; then
+                _chk "Schéma Jeedom" err "base vide : aucune table"
+            elif ! grep -Fxq "config" <<< "${schema_tables}"; then
+                _chk "Schéma Jeedom" err "table config absente (${DB_NAME})"
+            else
+                _chk "Schéma Jeedom" ok "table config présente ($(wc -l <<< "${schema_tables}") tables)"
+            fi
+        else
+            _chk "Base Jeedom" err "base '${DB_NAME}' absente ou inaccessible"
+        fi
     else
-        _chk "MariaDB" err "connexion impossible"
+        _chk "MariaDB" err "serveur/socket inaccessible"
     fi
 
     # ── Services web ──
@@ -480,10 +505,51 @@ show_health() {
         [[ "$st" == "active" ]] && _chk "$svc" ok "actif" || _chk "$svc" err "$st"
     done
 
+    # Datadir Debian par défaut : vérification en lecture seule des droits et
+    # de l'espace. Un datadir personnalisé reste à contrôler séparément.
+    local mysql_dir="/var/lib/mysql"
+    if [[ -d "${mysql_dir}" ]]; then
+        local mysql_dir_meta mysql_dir_pct mysql_dir_ipct
+        mysql_dir_meta=$(stat -c '%U:%G %a' "${mysql_dir}" 2>/dev/null || echo "stat indisponible")
+        if id mysql &>/dev/null; then
+            sudo -u mysql test -w "${mysql_dir}" \
+                && _chk "Datadir MariaDB" ok "mysql peut écrire (${mysql_dir_meta})" \
+                || _chk "Datadir MariaDB" err "mysql ne peut pas écrire (${mysql_dir_meta})"
+            local bad_owner_count; bad_owner_count=$(_mysql_datadir_bad_owner_count "${mysql_dir}")
+            if [[ "${bad_owner_count}" =~ ^[[:space:]]*[1-9][0-9]*$ ]]; then
+                _chk "Fichiers datadir MariaDB" warn "${bad_owner_count} fichier(s) non possédé(s) par mysql (profondeur 2)"
+            else
+                _chk "Fichiers datadir MariaDB" ok "propriétaire mysql à la profondeur contrôlée"
+            fi
+        else
+            _chk "Datadir MariaDB" warn "compte système mysql absent (${mysql_dir_meta})"
+        fi
+        mysql_dir_pct=$(df -P "${mysql_dir}" 2>/dev/null | awk 'NR==2{gsub(/%/,""); print $5}')
+        mysql_dir_ipct=$(df -Pi "${mysql_dir}" 2>/dev/null | awk 'NR==2{gsub(/%/,""); print $5}')
+        if [[ "${mysql_dir_pct}" =~ ^[0-9]+$ ]]; then
+            if [[ ${mysql_dir_pct} -ge 90 ]]; then _chk "Espace datadir MariaDB" err "${mysql_dir_pct}% utilisé"
+            elif [[ ${mysql_dir_pct} -ge 80 ]]; then _chk "Espace datadir MariaDB" warn "${mysql_dir_pct}% utilisé"
+            else _chk "Espace datadir MariaDB" ok "${mysql_dir_pct}% utilisé"; fi
+        fi
+        if [[ "${mysql_dir_ipct}" =~ ^[0-9]+$ && ${mysql_dir_ipct} -ge 90 ]]; then
+            _chk "Inodes datadir MariaDB" err "${mysql_dir_ipct}% utilisés"
+        elif [[ "${mysql_dir_ipct}" =~ ^[0-9]+$ && ${mysql_dir_ipct} -ge 80 ]]; then
+            _chk "Inodes datadir MariaDB" warn "${mysql_dir_ipct}% utilisés"
+        fi
+    fi
+
     # ── Daemon Jeedom ──
     _daemon_running \
         && _chk "Daemon Jeedom" ok "actif" \
         || _chk "Daemon Jeedom" err "introuvable"
+
+    local started_state
+    started_state=$(_jee_php 'echo jeedom::isStarted() ? "1" : "0";' 2>/dev/null | tail -1)
+    case "${started_state}" in
+        1) _chk "Démarrage Jeedom" ok "marqueur actif" ;;
+        0) _chk "Démarrage Jeedom" warn "marqueur absent : démarrage potentiellement bloqué" ;;
+        *) _chk "Démarrage Jeedom" warn "état indéterminé (core PHP indisponible)" ;;
+    esac
 
     # ── Disque ──
     local disk_pct; disk_pct=$(df "${JEEDOM_DIR}" | awk 'NR==2{gsub(/%/,""); print $5}')
@@ -814,6 +880,21 @@ _db_all_tables() {
 
     local -a tables=()
     [[ -n "${raw_tables}" ]] && mapfile -t tables <<< "${raw_tables}"
+
+    if [[ ${#tables[@]} -eq 0 ]]; then
+        echo -e "${R}✘ Aucune table trouvée : base vide ou schéma inaccessible, aucune opération lancée.${N}"
+        log_action "DB ${cmd} : aucune table trouvée"
+        [[ "$mode" == "interactive" ]] && pause
+        return 1
+    fi
+    local has_config=0
+    for tbl in "${tables[@]}"; do [[ "${tbl}" == "config" ]] && has_config=1; done
+    if [[ ${has_config} -eq 0 ]]; then
+        echo -e "${R}✘ Table Jeedom 'config' absente : schéma incomplet, aucune opération lancée.${N}"
+        log_action "DB ${cmd} : table config absente"
+        [[ "$mode" == "interactive" ]] && pause
+        return 1
+    fi
 
     local failed=0 tbl tbl_escaped res
     for tbl in "${tables[@]}"; do
@@ -1533,6 +1614,9 @@ generate_report() {
     h=$(show_health cli 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g')
     while IFS= read -r l; do
         [[ "${l}" == *"avertissement(s)"* ]] && continue
+        # Les contrôles MariaDB sont détaillés plus bas avec distinction
+        # serveur/base/schéma et ne doivent pas apparaître deux fois.
+        [[ "${l}" == *"MariaDB"* || "${l}" == *"Base Jeedom"* || "${l}" == *"Schéma Jeedom"* ]] && continue
         case "${l}" in
             *✔*) t="${l#*✔}"; _r_out "[OK]   ${t#"${t%%[! ]*}"}" ;;
             *⚠*) t="${l#*⚠}"; t="${t#"${t%%[! ]*}"}"; _r_out "[WARN] ${t}"
@@ -1588,12 +1672,37 @@ generate_report() {
     done <<< "${pl}"
     _r_item info "Daemons de plugins" "${ndok} en marche sur ${nd} signalés/suivis (les anomalies sont listées ci-dessus)"
 
+    # ── Diagnostic serveur / base / schéma MariaDB ──
+    _r_sec "Diagnostic MariaDB"
+    local db_server_ok=0 db_database_ok=0 db_schema db_schema_rc
+    if mysql --defaults-extra-file="${DB_OPTFILE}" -N -e "SELECT 1;" &>/dev/null; then
+        db_server_ok=1
+        _r_item ok "Serveur MariaDB" "connexion sans sélection de base réussie"
+        if mysql_cmd -e "SELECT 1;" &>/dev/null; then
+            db_database_ok=1
+            db_schema=$(mysql_cmd -N -e "SHOW TABLES;"); db_schema_rc=$?
+            if [[ ${db_schema_rc} -ne 0 ]]; then
+                _r_item err "Schéma Jeedom" "SHOW TABLES a échoué"
+            elif [[ -z "${db_schema}" ]]; then
+                _r_item err "Schéma Jeedom" "base vide : aucune table"
+            elif ! grep -Fxq "config" <<< "${db_schema}"; then
+                _r_item err "Schéma Jeedom" "table config absente (${DB_NAME})"
+            else
+                _r_item ok "Schéma Jeedom" "table config présente ($(wc -l <<< "${db_schema}") tables)"
+            fi
+        else
+            _r_item err "Base Jeedom" "${DB_NAME} absente ou inaccessible sur le serveur"
+        fi
+    else
+        _r_item err "Serveur MariaDB" "connexion impossible (service, socket ou identifiants)"
+    fi
+
     # ── MariaDB ──
     _r_sec "MariaDB"
     local st mc size
     st=$(mysql_cmd -N -e "SHOW GLOBAL STATUS WHERE Variable_name IN ('Uptime','Threads_connected','Max_used_connections','Aborted_connects','Slow_queries');")
     if [[ -z "${st}" ]]; then
-        _r_item err "Connexion MariaDB" "impossible (identifiants ou service)"
+        [[ ${db_server_ok} -eq 1 && ${db_database_ok} -eq 1 ]] && _r_item warn "Statistiques MariaDB" "base accessible, mais SHOW GLOBAL STATUS sans résultat"
     else
         mc=$(mysql_cmd -N -e "SELECT @@max_connections;")
         size=$(mysql_cmd -N -e "SELECT ROUND(SUM(data_length+index_length)/1024/1024,1) FROM information_schema.tables WHERE table_schema='${DB_NAME}';")
@@ -1601,6 +1710,32 @@ generate_report() {
         _r_item ok   "Connexion MariaDB" "$(mysql_cmd -N -e 'SELECT VERSION();'), base ${DB_NAME} (${size:-?} Mo)"
         _r_pct_item  "Connexions simultanées" "$(( ${tc:-0} * 100 / ${mc:-1} ))" "${tc}/${mc} (pic $(awk '$1=="Max_used_connections"{print $2}' <<< "${st}"))"
         _r_item info "Uptime / requêtes lentes" "$(awk '$1=="Uptime"{printf "%dj %dh", $2/86400, ($2%86400)/3600}' <<< "${st}") / $(awk '$1=="Slow_queries"{print $2}' <<< "${st}") lentes / $(awk '$1=="Aborted_connects"{print $2}' <<< "${st}") connexions refusées"
+    fi
+
+    # Datadir Debian par défaut : contrôle sans écriture. Un chemin absent
+    # peut indiquer une configuration personnalisée; il n'est pas déclaré en panne.
+    local mysql_dir="/var/lib/mysql" mysql_dir_pct mysql_dir_ipct
+    if [[ -d "${mysql_dir}" ]]; then
+        local mysql_dir_meta; mysql_dir_meta=$(stat -c '%U:%G %a' "${mysql_dir}" 2>/dev/null || echo "stat indisponible")
+        if id mysql &>/dev/null; then
+            sudo -u mysql test -w "${mysql_dir}" \
+                && _r_item ok "Écriture datadir MariaDB" "mysql peut écrire (${mysql_dir_meta})" \
+                || _r_item err "Écriture datadir MariaDB" "mysql ne peut pas écrire (${mysql_dir_meta})"
+            local bad_owner_count; bad_owner_count=$(_mysql_datadir_bad_owner_count "${mysql_dir}")
+            if [[ "${bad_owner_count}" =~ ^[[:space:]]*[1-9][0-9]*$ ]]; then
+                _r_item warn "Propriétaires fichiers MariaDB" "${bad_owner_count} fichier(s) non possédé(s) par mysql (profondeur 2)"
+            else
+                _r_item ok "Propriétaires fichiers MariaDB" "mysql à la profondeur contrôlée"
+            fi
+        else
+            _r_item warn "Écriture datadir MariaDB" "compte système mysql absent (${mysql_dir_meta})"
+        fi
+        mysql_dir_pct=$(df -P "${mysql_dir}" 2>/dev/null | awk 'NR==2{gsub(/%/,""); print $5}')
+        mysql_dir_ipct=$(df -Pi "${mysql_dir}" 2>/dev/null | awk 'NR==2{gsub(/%/,""); print $5}')
+        [[ "${mysql_dir_pct}" =~ ^[0-9]+$ ]] && _r_pct_item "Disque datadir MariaDB" "${mysql_dir_pct}" "${mysql_dir_pct}% utilisé"
+        [[ "${mysql_dir_ipct}" =~ ^[0-9]+$ ]] && _r_pct_item "Inodes datadir MariaDB" "${mysql_dir_ipct}" "${mysql_dir_ipct}% utilisés"
+    else
+        _r_item info "Datadir MariaDB" "/var/lib/mysql absent (chemin personnalisé possible)"
     fi
 
     # ── Ressources ──
@@ -1644,6 +1779,22 @@ generate_report() {
     if [[ -n "${failed_units}" ]]; then
         while IFS= read -r l; do _r_item warn "Unité systemd en échec" "${l}"; done <<< "${failed_units}"
     else _r_item ok "Unités systemd en échec" "aucune"; fi
+
+    local db_journal apache_journal journal_line
+    db_journal=$(journalctl -u mariadb -u mysql --since "24 hours ago" -p err -n 3 --no-pager 2>/dev/null)
+    if [[ -n "${db_journal}" ]]; then
+        _r_item warn "Erreurs MariaDB (24 h)" "messages trouvés; extraits ci-dessous"
+        while IFS= read -r journal_line; do _r_out "          [mariadb] ${journal_line:0:300}"; done <<< "${db_journal}"
+    else
+        _r_item info "Erreurs MariaDB (24 h)" "aucune erreur visible dans le journal systemd"
+    fi
+    apache_journal=$(journalctl -u apache2 --since "24 hours ago" -p err -n 3 --no-pager 2>/dev/null)
+    if [[ -n "${apache_journal}" ]]; then
+        _r_item warn "Erreurs Apache (24 h)" "messages trouvés; extraits ci-dessous"
+        while IFS= read -r journal_line; do _r_out "          [apache2] ${journal_line:0:300}"; done <<< "${apache_journal}"
+    else
+        _r_item info "Erreurs Apache (24 h)" "aucune erreur visible dans le journal systemd"
+    fi
 
     # ── Logs et messages Jeedom ──
     _r_sec "Logs et messages Jeedom"
