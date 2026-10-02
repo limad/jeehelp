@@ -2150,17 +2150,18 @@ ask_ai() {
 
 _ask_ai_run() {
     local wd="$1"; shift
-    local tty=0 pick=0 with_logs=0 dry=0 only="" rfile="" chan="auto"
+    local tty=0 pick=0 with_logs=0 dry=0 incl_invalid=0 only="" rfile="" chan="auto"
     [[ -t 0 && -t 1 ]] && tty=1
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --pick) pick=1 ;;
             --with-logs) with_logs=1 ;;
             --dry-run) dry=1 ;;
+            --include-invalid) incl_invalid=1 ;;
             --provider) only="${2:-}"; shift ;;
             --file) rfile="${2:-}"; shift ;;
             --channel) chan="${2:-auto}"; shift ;;
-            *) echo "Option inconnue : $1 (--pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run)" >&2; return 2 ;;
+            *) echo "Option inconnue : $1 (--pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run --include-invalid)" >&2; return 2 ;;
         esac
         shift
     done
@@ -2191,7 +2192,7 @@ _ask_ai_run() {
     local line id name prov model scope state
     if [[ "${chan}" != direct && -f "${AI_CLI}" ]]; then
         while IFS='|' read -r id name prov model scope state; do
-            [[ "${state}" == ok && -n "${id}" ]] || continue
+            [[ -n "${id}" && ( "${state}" == ok || ( ${incl_invalid} -eq 1 && "${state}" == invalid ) ) ]] || continue
             [[ -n "${only}" && "${only}" != "${id}" ]] && continue
             if [[ "${scope}" == local ]]; then locals+=("plugin|${id}|${name}|${prov}|${model}|local")
             else clouds+=("plugin|${id}|${name}|${prov}|${model}|cloud"); fi
@@ -2395,7 +2396,7 @@ cli_mode() {
             echo "  --check             Vérification rapide (code retour : 0 OK, 1 anomalie)"
             echo "  --health            Health check complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --report            Rapport de diagnostic complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
-            echo "  --ask [options]     Analyse du rapport par IA (local d'abord) : --pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run"
+            echo "  --ask [options]     Analyse du rapport par IA (local d'abord) : --pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run --include-invalid"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
             exit 1 ;;
