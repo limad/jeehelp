@@ -1608,8 +1608,8 @@ generate_report() {
     local nu; nu=$(_r_kv "${core}" needupdate)
     [[ "${nu:-0}" -gt 0 ]] && _r_item info "Mises à jour Jeedom/plugins" "${nu} élément(s)" || _r_item ok "Mises à jour Jeedom/plugins" "à jour"
 
-    # ── Santé (mêmes contrôles que le menu Santé) ──
-    _r_sec "Santé (mêmes contrôles que le menu « Santé générale »)"
+    # ── Santé ──
+    _r_sec "Santé"
     local h l t
     h=$(show_health cli 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g')
     while IFS= read -r l; do
