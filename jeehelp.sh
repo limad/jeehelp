@@ -364,7 +364,7 @@ show_system_info() {
     echo
     printf "  ${W}%-16s${N} %s\n" "Jeedom"   "${jee_ver}"
     printf "  ${W}%-16s${N} %s\n" "PHP"      "$(php -r 'echo PHP_VERSION;' 2>/dev/null)"
-    printf "  ${W}%-16s${N} %s\n" "MySQL"    "$(mysql --version 2>/dev/null | awk '{print $5}' | tr -d ',')"
+    printf "  ${W}%-16s${N} %s\n" "MariaDB"  "$(mysql_cmd -N -e "SELECT VERSION();" 2>/dev/null || mysql --version 2>/dev/null | awk '{print $5}' | tr -d ',')"
     echo
     printf "  ${W}%-16s${N} %s\n" "Uptime"    "$(uptime -p 2>/dev/null || uptime)"
     printf "  ${W}%-16s${N} %s\n" "CPU load"  "$(awk '{print $1,$2,$3}' /proc/loadavg)"
@@ -413,7 +413,7 @@ _ssl_check() {
              -servername "${domain}" 2>/dev/null \
              | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
     if [[ -z "$expiry" ]]; then
-        echo -e "  ${Y}Pas de HTTPS détecté sur ${domain}${N}"; return 1
+        echo -e "  ${Y}Pas de HTTPS détecté sur ${domain}${N}"; return 0  # info : une box LAN sans HTTPS n'est pas une anomalie
     fi
     local diff_days; diff_days=$(( ($(date -d "$expiry" +%s 2>/dev/null) - $(date +%s)) / 86400 ))
     if [[ $diff_days -le 14 ]]; then
@@ -456,12 +456,12 @@ show_health() {
         _chk "PHP" err "non détecté"
     fi
 
-    # ── MySQL connexion ──
+    # ── MariaDB connexion ──
     load_mysql_creds
     if mysql_cmd -e "SELECT 1;" &>/dev/null; then
-        _chk "MySQL" ok "connecté (${DB_NAME})"
+        _chk "MariaDB" ok "connecté (${DB_NAME})"
     else
-        _chk "MySQL" err "connexion impossible"
+        _chk "MariaDB" err "connexion impossible"
     fi
 
     # ── Services web ──
@@ -869,7 +869,7 @@ _db_mysqlcheck() {
 }
 
 _db_dump() {
-    header; section "Dump MySQL"
+    header; section "Dump MariaDB"
     load_mysql_creds
     local file="${BACKUP_DIR}/dump_${DB_NAME}_$(date +%Y%m%d-%H%M%S).sql.gz"
     echo -e "${Y}Dump vers : $(basename "${file}")${N}"
@@ -937,7 +937,7 @@ menu_services() {
     local opts=(
         "📡  État des services"
         "🌐  Redémarrer Apache / Nginx"
-        "🗄️   Redémarrer MySQL / MariaDB"
+        "🗄️   Redémarrer MariaDB"
         "⚙️   Redémarrer daemon Jeedom (cron)"
         "🔄  Relancer Jeedom complet"
         "💻  Reboot serveur"
@@ -950,7 +950,7 @@ menu_services() {
             0) _svc_status ;;
             1) header; section "Redémarrage Apache/Nginx"
                for s in apache2 nginx; do svc_ctl restart "$s"; done; pause ;;
-            2) header; section "Redémarrage MySQL/MariaDB"
+            2) header; section "Redémarrage MariaDB"
                for s in mysql mariadb; do svc_ctl restart "$s"; done; pause ;;
             3) _svc_restart_daemon ;;
             4) header
@@ -1217,7 +1217,7 @@ _unattended_setup() {
 _unattended_dryrun() {
     header; section "Dry-run unattended-upgrades"
     command -v unattended-upgrade &>/dev/null \
-        && unattended-upgrade --dry-run --debug 2>&1 | tail -30 \
+        && unattended-upgrade --dry-run -v 2>&1 | tail -30 \
         || echo -e "${R}unattended-upgrades non installé.${N}"
     pause
 }
@@ -1376,19 +1376,24 @@ _rescue_test_url() {
 _rescue_disable_plugins() {
     header; section "Désactiver tous les plugins (mode secours)"
     load_mysql_creds
-    local before; before=$(mysql_cmd -N -e "SELECT COUNT(*) FROM config WHERE \`key\`='active' AND \`value\`='1';")
+    # Liste des plugins actifs, relevée AVANT la désactivation pour pouvoir
+    # les réactiver ensuite (la commande Jeedom met tout à 0 sans mémoire).
+    local active; active=$(mysql_cmd -N -e "SELECT plugin FROM config WHERE \`key\`='active' AND \`value\`='1' ORDER BY plugin;" | paste -sd' ')
+    local before; before=$(wc -w <<< "${active}")
     echo -e "  Reproduit exactement la commande rapide Jeedom (page Database, mode secours) :"
     echo -e "  ${DIM}UPDATE \`config\` SET \`value\`=0 WHERE \`key\`='active';${N}"
-    echo -e "  Plugins actuellement actifs : ${W}${before:-?}${N}\n"
+    echo -e "  Plugins actuellement actifs (${W}${before}${N}) : ${active:-aucun}\n"
     echo -e "  ${R}⚠  Utile si un plugin bloque le rendu de l'interface web.${N}"
-    echo -e "  ${Y}   Réactivation ensuite au cas par cas depuis l'interface Jeedom${N}"
-    echo -e "  ${Y}   normale (Plugins) une fois le problème identifié.${N}\n"
+    echo -e "  ${Y}   La liste sera journalisée dans ${LOG_DIR}/jeehelp_rescue.log${N}"
+    echo -e "  ${Y}   pour une réactivation ultérieure.${N}\n"
 
-    confirm "Désactiver les ${before:-0} plugin(s) actif(s)" || { echo -e "${Y}Annulé.${N}"; pause; return; }
+    confirm "Désactiver les ${before} plugin(s) actif(s)" || { echo -e "${Y}Annulé.${N}"; pause; return; }
 
+    # Journalisé avant l'UPDATE : la liste reste disponible même en cas d'échec.
+    _rescue_log "Plugins actifs avant désactivation (${before}) : ${active:-aucun}"
     if mysql_cmd -e "UPDATE \`config\` SET \`value\`=0 WHERE \`key\`='active';"; then
-        echo -e "\n${G}✔ ${before:-0} plugin(s) désactivé(s).${N}"
-        _rescue_log "Plugins désactivés (${before:-0} actifs avant action)"
+        echo -e "\n${G}✔ ${before} plugin(s) désactivé(s).${N}"
+        _rescue_log "Plugins désactivés (${before})"
     else
         echo -e "\n${R}✘ Erreur lors de la désactivation.${N}"
         _rescue_log "ÉCHEC désactivation plugins"
@@ -1479,7 +1484,7 @@ cli_mode() {
         --upgrade-security)
             echo "[CLI] unattended-upgrade..."
             if command -v unattended-upgrade &>/dev/null; then
-                unattended-upgrade --debug 2>&1
+                unattended-upgrade -v 2>&1
                 rc=$?
                 log_action "CLI --upgrade-security (rc=${rc})"
             else

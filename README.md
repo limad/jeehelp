@@ -46,10 +46,10 @@ message d'erreur si lancé sans `sudo`) et détecte Jeedom dans `/var/www/html`.
 | Section | Contenu |
 |---|---|
 | 📊 Informations système & watchdog | OS, uptime, charge, RAM, disque, version Jeedom, vérification watchdog |
-| 🏥 Santé générale & droits fichiers | Diagnostic complet (PHP, MySQL, services, daemon, disque, RAM, CPU, dernière sauvegarde, permissions, logs d'erreurs, SSL, mises à jour apt) + rétablissement des droits fichiers |
+| 🏥 Santé générale & droits fichiers | Diagnostic complet (PHP, MariaDB, services, daemon, disque, RAM, CPU, dernière sauvegarde, permissions, logs d'erreurs, SSL, mises à jour apt) + rétablissement des droits fichiers |
 | 💾 Sauvegardes | Lister, créer, restaurer, supprimer, rotation (conserve les 3 dernières) |
 | 🗄️ Base de données | ANALYZE / REPAIR / OPTIMIZE table par table, taille des tables, `mysqlcheck --auto-repair`, dump SQL complet, import d'un dump, vidage du cache Jeedom |
-| ⚙️ Services & Jeedom | État des services, redémarrage Apache/Nginx, MySQL/MariaDB, daemon Jeedom (cron), relance complète de Jeedom, reboot serveur |
+| ⚙️ Services & Jeedom | État des services, redémarrage Apache/Nginx, MariaDB, daemon Jeedom (cron), relance complète de Jeedom, reboot serveur |
 | 📋 Logs & audit | Lister/afficher/suivre (`tail -f`) les logs Jeedom, vider tous les logs, journalctl système, journal d'audit des actions jeehelp |
 | 🌐 Réseau & SSL | Interfaces réseau, test de connectivité internet, ports en écoute, connexions actives, ping, vérification SSL d'un domaine |
 | 🔄 Mises à jour & sécurité | Vérifier/appliquer les mises à jour Jeedom, `apt update && upgrade`, configuration `unattended-upgrades` (reboot nocturne auto si patch noyau), dry-run et statut |
