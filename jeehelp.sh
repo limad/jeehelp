@@ -582,6 +582,9 @@ show_health() {
 
 # ── Rétablissement des droits ────────────────────────────────
 
+#  Les liens symboliques sont exclus (! -type l) : chmod suit le lien et échoue
+#  sur un lien cassé (ex: anciens venv dans plugins/bak), ce qui faisait
+#  échouer toute l'étape alors que chmod -R du core les ignore.
 #  Reproduit le comportement natif de jeedom::cleanFileSystemRight()
 #  (bouton "Rétablissement des droits" du core) : chown www-data,
 #  chmod 775 récursif (y compris fichiers cachés), 665 sur les logs.
@@ -608,8 +611,8 @@ fix_permissions() {
     )
     local -a cmds=(
         "chown -R www-data:www-data -- '${JEEDOM_DIR}'"
-        "find '${JEEDOM_DIR}' -mindepth 1 ! -path '*/.*' -exec chmod 775 {} +"
-        "find '${JEEDOM_DIR}' -mindepth 1 -path '*/.*' -exec chmod 775 {} +"
+        "find '${JEEDOM_DIR}' -mindepth 1 ! -type l ! -path '*/.*' -exec chmod 775 {} +"
+        "find '${JEEDOM_DIR}' -mindepth 1 ! -type l -path '*/.*' -exec chmod 775 {} +"
         "find '${JEEDOM_DIR}/log' -type f -exec chmod 665 {} +"
     )
 
