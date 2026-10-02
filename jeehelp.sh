@@ -1336,6 +1336,8 @@ _rescue_log() {
     if [[ -L "${target}" ]] || { [[ -e "${target}" ]] && [[ ! -f "${target}" ]]; }; then
         log_action "RESCUE-LOG-ALERTE: ${target} n'est pas un fichier régulier (lien symbolique ?) — écriture refusée"
     else
+        # Même propriétaire/droits que les autres logs Jeedom (visible depuis l'UI).
+        [[ -e "${target}" ]] || { : > "${target}" && chown www-data:www-data "${target}" && chmod 664 "${target}"; } 2>/dev/null
         echo "${line}" >> "${target}" 2>/dev/null
     fi
     log_action "RESCUE: ${msg}"
@@ -1451,6 +1453,323 @@ menu_rescue() {
 }
 
 # ============================================================
+#  RAPPORT DE DIAGNOSTIC
+# ============================================================
+#  Rassemble en un seul document tout ce qui peut justifier un blocage :
+#  contrôles de la page Santé, accessibilité de l'UI et de la page de
+#  secours, moteur cron, plugins actifs et leurs daemons/dépendances,
+#  MariaDB, ressources, services, logs, messages Jeedom, sauvegardes,
+#  droits, réseau, mises à jour et actions récentes de jeehelp.
+#  Enregistré dans ${LOG_DIR}/jeehelp_rapport_<date>.txt (10 derniers
+#  conservés). Aucun secret n'y figure (pas de mots de passe, ni de lignes
+#  de commande complètes : elles peuvent contenir des clés API).
+
+declare -g _R_BODY=""
+declare -ga _R_ISSUES=()
+
+_r_out() { printf '%s\n' "$*" >> "${_R_BODY}"; }
+_r_sec() { _r_out ""; _r_out "── $1"; }
+# _r_item ok|warn|err|info "libellé" "détail"
+_r_item() {
+    local st="$1" label="$2" detail="${3:-}" tag
+    case "${st}" in
+        ok)   tag="[OK]  " ;;
+        warn) tag="[WARN]"; _R_ISSUES+=("WARN|${label}|${detail}") ;;
+        err)  tag="[ERR] "; _R_ISSUES+=("ERR|${label}|${detail}") ;;
+        *)    tag="[INFO]" ;;
+    esac
+    _r_out "$(printf '%s %-32s %s' "${tag}" "${label}" "${detail}")"
+}
+_r_pct_item() {  # label pct detail (seuils 80/90)
+    local label="$1" pct="$2" detail="$3"
+    if   [[ "${pct}" -ge 90 ]]; then _r_item err  "${label}" "${detail}"
+    elif [[ "${pct}" -ge 80 ]]; then _r_item warn "${label}" "${detail}"
+    else                             _r_item ok   "${label}" "${detail}"; fi
+}
+_r_kv() { awk -F= -v k="$2" '$1==k{sub(/^[^=]*=/,""); print; exit}' <<< "$1"; }
+
+generate_report() {
+    local mode="${1:-interactive}"
+    _R_BODY=$(mktemp); _R_ISSUES=()
+    load_mysql_creds
+    local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    local jv; jv=$(_jee_php 'echo jeedom::version();' | tail -1)
+
+    # ── Jeedom : état du core ──
+    local core; core=$(_jee_php '
+        $c = config::byKey("enableCron");     echo "enableCron=" . ($c === "" ? 1 : $c) . "\n";
+        $s = config::byKey("enableScenario"); echo "enableScenario=" . ($s === "" ? 1 : $s) . "\n";
+        echo "started=" . (jeedom::isStarted() ? 1 : 0) . "\n";
+        echo "dateok=" . (jeedom::isDateOk() ? 1 : 0) . "\n";
+        $all = scenario::all(); $en = 0; $run = 0;
+        foreach ($all as $sc) { if ($sc->getIsActive()) $en++; if ($sc->getState() == "in progress") $run++; }
+        echo "scenarios=" . count($all) . " dont " . $en . " actifs, " . $run . " en cours\n";
+        echo "needupdate=" . update::nbNeedUpdate() . "\n";
+    ')
+    _r_sec "Jeedom (état du core)"
+    _r_item info "Version Jeedom" "${jv:-inconnue}"
+    [[ "$(_r_kv "${core}" enableCron)" == "0" ]] \
+        && _r_item err "Système cron" "DÉSACTIVÉ (enableCron=0) : plus de tâches, ni de daemons de plugins" \
+        || _r_item ok  "Système cron" "activé"
+    if _daemon_running; then _r_item ok "Moteur cron (jeeCron)" "actif (PID file récent)"
+    else _r_item err "Moteur cron (jeeCron)" "aucun passage depuis plus de 120 s"; fi
+    [[ "$(_r_kv "${core}" enableScenario)" == "0" ]] \
+        && _r_item warn "Scénarios" "DÉSACTIVÉS globalement (enableScenario=0)" \
+        || _r_item ok   "Scénarios" "$(_r_kv "${core}" scenarios)"
+    [[ "$(_r_kv "${core}" started)" == "1" ]] \
+        && _r_item ok   "Jeedom démarré" "oui" \
+        || _r_item warn "Jeedom démarré" "fichier 'started' absent : les daemons restent bloqués"
+    [[ "$(_r_kv "${core}" dateok)" == "1" ]] \
+        && _r_item ok  "Date système" "cohérente" \
+        || _r_item err "Date système" "incohérente (Jeedom bloque certaines tâches)"
+    local nu; nu=$(_r_kv "${core}" needupdate)
+    [[ "${nu:-0}" -gt 0 ]] && _r_item info "Mises à jour Jeedom/plugins" "${nu} élément(s)" || _r_item ok "Mises à jour Jeedom/plugins" "à jour"
+
+    # ── Santé (mêmes contrôles que le menu Santé) ──
+    _r_sec "Santé (mêmes contrôles que le menu « Santé générale »)"
+    local h l t
+    h=$(show_health cli 2>&1 | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g')
+    while IFS= read -r l; do
+        [[ "${l}" == *"avertissement(s)"* ]] && continue
+        case "${l}" in
+            *✔*) t="${l#*✔}"; _r_out "[OK]   ${t#"${t%%[! ]*}"}" ;;
+            *⚠*) t="${l#*⚠}"; t="${t#"${t%%[! ]*}"}"; _r_out "[WARN] ${t}"
+                 # Permissions et http.error ont leur propre section détaillée plus bas
+                 [[ "${t}" == Permissions* || "${t}" == http.error* ]] || _R_ISSUES+=("WARN|Santé|${t}") ;;
+            *✘*) t="${l#*✘}"; t="${t#"${t%%[! ]*}"}"; _r_out "[ERR]  ${t}"; _R_ISSUES+=("ERR|Santé|${t}") ;;
+        esac
+    done <<< "${h}"
+
+    # ── Accessibilité de l'interface et de la page de secours ──
+    _r_sec "Accessibilité web (interface et page de secours)"
+    local -a hosts=("127.0.0.1"); [[ -n "${ip}" && "${ip}" != "127.0.0.1" ]] && hosts+=("${ip}")
+    local h2 p res code tm label
+    for h2 in "${hosts[@]}"; do
+        for p in "/index.php?v=d" "/index.php?v=d&p=database&rescue=1"; do
+            res=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 8 "http://${h2}${p}" 2>/dev/null)
+            code="${res%% *}"; tm="${res##* }"
+            [[ "${p}" == *rescue* ]] && label="Page de secours @${h2}" || label="Interface Jeedom @${h2}"
+            if   [[ "${code}" == "200" || "${code}" == "302" ]]; then
+                 awk -v t="${tm}" 'BEGIN{exit !(t>3)}' \
+                    && _r_item warn "${label}" "HTTP ${code} mais lente (${tm}s)" \
+                    || _r_item ok   "${label}" "HTTP ${code} (${tm}s)"
+            elif [[ -z "${code}" || "${code}" == "000" ]]; then _r_item err "${label}" "injoignable (timeout 8 s)"
+            else _r_item err "${label}" "HTTP ${code}"; fi
+        done
+    done
+
+    # ── Plugins actifs, daemons et dépendances ──
+    _r_sec "Plugins actifs"
+    local active; active=$(mysql_cmd -N -e "SELECT plugin FROM config WHERE \`key\`='active' AND \`value\`='1' ORDER BY plugin;" | paste -sd' ')
+    _r_item info "Plugins actifs ($(wc -w <<< "${active}"))" ""
+    fold -s -w 100 <<< "${active}" | sed 's/^/        /' >> "${_R_BODY}"
+    local pl pid pstate pauto pdep pmsg
+    pl=$(_jee_php '
+        foreach (plugin::listPlugin(true) as $p) {
+            try {
+                $dep = "-";
+                if ($p->getHasDependency() == 1 && method_exists($p->getId(), "dependancy_info")) { $d = $p->dependancy_info(); $dep = $d["state"] ?? "?"; }
+                if ($p->getHasOwnDeamon() == 1) { $i = $p->deamon_info(); echo $p->getId() . "|" . $i["state"] . "|" . $i["auto"] . "|" . $dep . "|" . str_replace(["\n","|"], " ", $i["launchable_message"] ?? "") . "\n"; }
+                elseif ($dep != "-" && $dep != "ok") { echo $p->getId() . "|-|-|" . $dep . "|\n"; }
+            } catch (\Throwable $e) { echo $p->getId() . "|exception|-|-|" . str_replace(["\n","|"], " ", $e->getMessage()) . "\n"; }
+        }
+    ')
+    local nd=0 ndok=0
+    while IFS='|' read -r pid pstate pauto pdep pmsg; do
+        [[ -z "${pid}" || "${pid}" == *" "* || "${pid}" == PHP* ]] && continue
+        nd=$((nd+1))
+        if   [[ "${pstate}" == "exception" ]]; then _r_item warn "Plugin ${pid}" "erreur lecture état : ${pmsg:0:100}"
+        elif [[ "${pstate}" == "nok" && "${pauto}" == "1" ]]; then _r_item warn "Daemon ${pid}" "ARRÊTÉ alors que la gestion auto est active ${pmsg:+(${pmsg:0:80})}"
+        elif [[ "${pstate}" == "nok" ]]; then _r_item info "Daemon ${pid}" "arrêté (gestion auto désactivée)"
+        else ndok=$((ndok+1)); fi
+        [[ "${pdep}" != "-" && "${pdep}" != "ok" && "${pdep}" != "" ]] && _r_item warn "Dépendances ${pid}" "état : ${pdep}"
+    done <<< "${pl}"
+    _r_item info "Daemons de plugins" "${ndok} en marche sur ${nd} signalés/suivis (les anomalies sont listées ci-dessus)"
+
+    # ── MariaDB ──
+    _r_sec "MariaDB"
+    local st mc size
+    st=$(mysql_cmd -N -e "SHOW GLOBAL STATUS WHERE Variable_name IN ('Uptime','Threads_connected','Max_used_connections','Aborted_connects','Slow_queries');")
+    if [[ -z "${st}" ]]; then
+        _r_item err "Connexion MariaDB" "impossible (identifiants ou service)"
+    else
+        mc=$(mysql_cmd -N -e "SELECT @@max_connections;")
+        size=$(mysql_cmd -N -e "SELECT ROUND(SUM(data_length+index_length)/1024/1024,1) FROM information_schema.tables WHERE table_schema='${DB_NAME}';")
+        local tc; tc=$(awk '$1=="Threads_connected"{print $2}' <<< "${st}")
+        _r_item ok   "Connexion MariaDB" "$(mysql_cmd -N -e 'SELECT VERSION();'), base ${DB_NAME} (${size:-?} Mo)"
+        _r_pct_item  "Connexions simultanées" "$(( ${tc:-0} * 100 / ${mc:-1} ))" "${tc}/${mc} (pic $(awk '$1=="Max_used_connections"{print $2}' <<< "${st}"))"
+        _r_item info "Uptime / requêtes lentes" "$(awk '$1=="Uptime"{printf "%dj %dh", $2/86400, ($2%86400)/3600}' <<< "${st}") / $(awk '$1=="Slow_queries"{print $2}' <<< "${st}") lentes / $(awk '$1=="Aborted_connects"{print $2}' <<< "${st}") connexions refusées"
+    fi
+
+    # ── Ressources ──
+    _r_sec "Ressources système"
+    local d pct ipct
+    for d in / "${JEEDOM_DIR}" /tmp; do
+        pct=$(df -P "${d}" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+        ipct=$(df -Pi "${d}" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+        [[ -n "${pct}" ]]  && _r_pct_item "Disque ${d}" "${pct}"  "${pct}% utilisé ($(df -Ph "${d}" | awk 'NR==2{print $3"/"$2}'))"
+        [[ "${ipct}" =~ ^[0-9]+$ ]] && _r_pct_item "Inodes ${d}" "${ipct}" "${ipct}% utilisés"
+    done
+    local mem_t mem_a sw_t sw_u load cpus
+    read -r mem_t mem_a < <(free -m | awk '/^Mem:/{print $2, $7}')
+    read -r sw_t sw_u < <(free -m | awk '/^Swap:/{print $2, $3}')
+    [[ $(( mem_a * 100 / (mem_t + 1) )) -lt 10 ]] \
+        && _r_item err  "Mémoire disponible" "${mem_a} Mo sur ${mem_t} Mo (< 10 %)" \
+        || _r_item ok   "Mémoire disponible" "${mem_a} Mo sur ${mem_t} Mo"
+    [[ "${sw_t:-0}" -gt 0 && $(( sw_u * 100 / sw_t )) -ge 50 ]] \
+        && _r_item warn "Swap" "${sw_u}/${sw_t} Mo utilisés (≥ 50 %)" \
+        || _r_item ok   "Swap" "${sw_u:-0}/${sw_t:-0} Mo"
+    load=$(awk '{print $1" "$2" "$3}' /proc/loadavg); cpus=$(nproc 2>/dev/null || echo 1)
+    awk -v l="${load%% *}" -v c="${cpus}" 'BEGIN{exit !(l>c*1.5)}' \
+        && _r_item warn "Charge CPU" "${load} sur ${cpus} cœurs (> 1,5 × cœurs)" \
+        || _r_item ok   "Charge CPU" "${load} sur ${cpus} cœurs"
+    local zomb; zomb=$(ps -eo stat | grep -c '^Z')
+    [[ "${zomb}" -gt 0 ]] && _r_item warn "Processus zombies" "${zomb}" || _r_item ok "Processus zombies" "0"
+    local oom; oom=$(journalctl -k --since "7 days ago" --no-pager 2>/dev/null | grep -ciE "out of memory|oom-kill|killed process")
+    [[ "${oom:-0}" -gt 0 ]] && _r_item err "OOM killer (7 jours)" "${oom} événement(s) : la mémoire a été saturée" || _r_item ok "OOM killer (7 jours)" "aucun"
+    _r_item info "Top CPU (noms seuls)" "$(ps -eo comm,pcpu --sort=-pcpu | awk 'NR>1 && NR<=6{printf "%s %s%%  ", $1, $2}')"
+    _r_item info "Top mémoire (noms seuls)" "$(ps -eo comm,pmem --sort=-pmem | awk 'NR>1 && NR<=6{printf "%s %s%%  ", $1, $2}')"
+
+    # ── Services ──
+    _r_sec "Services"
+    local svc s_st
+    for svc in apache2 mariadb cron; do
+        _svc_exists "${svc}" || continue
+        s_st=$(systemctl is-active "${svc}" 2>/dev/null)
+        [[ "${s_st}" == "active" ]] && _r_item ok "Service ${svc}" "actif" || _r_item err "Service ${svc}" "${s_st}"
+    done
+    local failed_units; failed_units=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+    if [[ -n "${failed_units}" ]]; then
+        while IFS= read -r l; do _r_item warn "Unité systemd en échec" "${l}"; done <<< "${failed_units}"
+    else _r_item ok "Unités systemd en échec" "aucune"; fi
+
+    # ── Logs et messages Jeedom ──
+    _r_sec "Logs et messages Jeedom"
+    local he=0; [[ -f "${LOG_DIR}/http.error" ]] && he=$(wc -l < "${LOG_DIR}/http.error")
+    [[ "${he}" -gt 500 ]] && _r_item warn "log/http.error" "${he} lignes" || _r_item ok "log/http.error" "${he} lignes"
+    _r_item info "Taille du dossier log" "$(du -sh "${LOG_DIR}" 2>/dev/null | cut -f1) ; plus gros : $(ls -S "${LOG_DIR}" 2>/dev/null | head -3 | while read -r f; do printf '%s(%s) ' "${f}" "$(du -h "${LOG_DIR}/${f}" 2>/dev/null | cut -f1)"; done)"
+    local big; big=$(find "${LOG_DIR}" -maxdepth 1 -type f -size +100M 2>/dev/null)
+    [[ -n "${big}" ]] && _r_item warn "Log > 100 Mo" "$(basename -a ${big} | paste -sd' ')"
+    if [[ -f "${LOG_DIR}/http.error" ]]; then
+        # Une ligne = une erreur, attribuée au premier chemin plugins/xxx ou core/xxx cité
+        # après " in /var/www/html/" (et non à chaque occurrence dans la trace de pile).
+        local fat; fat=$(grep -a "PHP Fatal error" "${LOG_DIR}/http.error" | awk 'match($0, / in \/var\/www\/html\/(plugins\/[^\/]+|core\/[^\/]+)/) {print substr($0,RSTART+18,RLENGTH-18)}' | sort | uniq -c | sort -rn | head -5 | awk '{printf "%s (%s)  ", $2, $1}')
+        [[ -n "${fat}" ]] && _r_item warn "Erreurs fatales PHP (dans http.error)" "${fat}"
+        _r_out "        dernières lignes de http.error :"
+        tail -n 5 "${LOG_DIR}/http.error" | cut -c1-200 | sed 's/^/          /' >> "${_R_BODY}"
+    fi
+    local nmsg; nmsg=$(mysql_cmd -N -e "SELECT COUNT(*) FROM message;")
+    [[ "${nmsg:-0}" -gt 50 ]] && _r_item warn "Messages Jeedom (centre de messages)" "${nmsg} messages" || _r_item ok "Messages Jeedom (centre de messages)" "${nmsg:-?} messages"
+    if [[ "${nmsg:-0}" -gt 0 ]]; then
+        _r_item info "Messages par plugin (top 5)" "$(mysql_cmd -N -e "SELECT CONCAT(plugin,' (',COUNT(*),')') FROM message GROUP BY plugin ORDER BY COUNT(*) DESC LIMIT 5;" | paste -sd' ')"
+        _r_out "        5 derniers messages :"
+        mysql_cmd -N -e "SELECT CONCAT(date,'  ',plugin,'  ',LEFT(REPLACE(message,CHAR(10),' '),110)) FROM message ORDER BY date DESC LIMIT 5;" | sed 's/^/          /' >> "${_R_BODY}"
+    fi
+
+    # ── Sauvegardes ──
+    _r_sec "Sauvegardes"
+    local lb age; lb=$(ls -t "${BACKUP_DIR}"/*.tar.gz 2>/dev/null | head -1)
+    if [[ -z "${lb}" ]]; then _r_item err "Dernière sauvegarde" "aucune"
+    else
+        age=$(( ($(date +%s) - $(stat -c %Y "${lb}")) / 86400 ))
+        if   [[ ${age} -le 1 ]]; then _r_item ok   "Dernière sauvegarde" "${age} j : $(basename "${lb}") ($(du -h "${lb}" | cut -f1))"
+        elif [[ ${age} -le 7 ]]; then _r_item warn "Dernière sauvegarde" "${age} j : $(basename "${lb}")"
+        else _r_item err "Dernière sauvegarde" "${age} j : $(basename "${lb}")"; fi
+    fi
+    _r_item info "Nombre / taille du dossier backup" "$(ls "${BACKUP_DIR}"/*.tar.gz 2>/dev/null | wc -l) fichier(s) / $(du -sh "${BACKUP_DIR}" 2>/dev/null | cut -f1)"
+
+    # ── Droits ──
+    _r_sec "Droits et propriétaires"
+    local bad nbad; bad=$(find "${JEEDOM_DIR}" -maxdepth 3 ! -user www-data ! -type l 2>/dev/null | grep -v "^${JEEDOM_DIR}$")
+    nbad=$(grep -c . <<< "${bad}")
+    if [[ "${nbad}" -eq 0 ]]; then _r_item ok "Fichiers non www-data (prof. 3)" "0"
+    else
+        _r_item warn "Fichiers non www-data (prof. 3)" "${nbad} (ex. : $(head -3 <<< "${bad}" | paste -sd' '))"
+    fi
+    _r_item info "common.config.php" "$(stat -c '%U:%G %a' "${CONF_FILE}" 2>/dev/null)"
+    sudo -u www-data test -w "${LOG_DIR}" \
+        && _r_item ok  "Écriture de log/ par www-data" "oui" \
+        || _r_item err "Écriture de log/ par www-data" "NON : Jeedom ne peut plus écrire ses logs"
+
+    # ── Réseau ──
+    _r_sec "Réseau"
+    _r_item info "Adresses IP" "$(hostname -I 2>/dev/null | cut -c1-100)"
+    ping -c1 -W2 1.1.1.1 &>/dev/null && _r_item ok "Connectivité Internet (ping 1.1.1.1)" "oui" || _r_item warn "Connectivité Internet (ping 1.1.1.1)" "KO"
+    getent hosts market.jeedom.com &>/dev/null && _r_item ok "Résolution DNS (market.jeedom.com)" "oui" || _r_item warn "Résolution DNS (market.jeedom.com)" "KO"
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 https://market.jeedom.com 2>/dev/null)
+    [[ "${code}" =~ ^[23] ]] && _r_item ok "Market Jeedom (HTTPS)" "HTTP ${code}" || _r_item warn "Market Jeedom (HTTPS)" "HTTP ${code:-timeout}"
+
+    # ── Système : mises à jour ──
+    _r_sec "Système"
+    _r_item info "OS / noyau / uptime" "$(. /etc/os-release; echo "${PRETTY_NAME}") / $(uname -r) / $(uptime -p)"
+    local nup; nup=$(apt list --upgradable 2>/dev/null | grep -c upgradable)
+    [[ "${nup}" -gt 20 ]] && _r_item warn "Paquets à mettre à jour" "${nup}" || _r_item ok "Paquets à mettre à jour" "${nup}"
+    [[ -f /var/run/reboot-required ]] && _r_item warn "Redémarrage requis" "oui (mise à jour noyau/libc)" || _r_item ok "Redémarrage requis" "non"
+
+    # ── Actions récentes de jeehelp ──
+    _r_sec "Actions récentes de jeehelp (audit et mode secours)"
+    if [[ -f "${AUDIT_LOG}" ]]; then tail -n 8 "${AUDIT_LOG}" | cut -c1-200 | sed 's/^/        /' >> "${_R_BODY}"; else _r_out "        (aucune)"; fi
+    if [[ -f "${LOG_DIR}/jeehelp_rescue.log" ]]; then
+        _r_out "        journal du mode secours :"
+        tail -n 8 "${LOG_DIR}/jeehelp_rescue.log" | cut -c1-300 | sed 's/^/          /' >> "${_R_BODY}"
+    fi
+
+    # ── Assemblage : synthèse en tête ──
+    local nerr=0 nwarn=0 it
+    for it in "${_R_ISSUES[@]}"; do [[ "${it}" == ERR* ]] && nerr=$((nerr+1)) || nwarn=$((nwarn+1)); done
+    local file="${LOG_DIR}/jeehelp_rapport_$(date +%Y%m%d-%H%M%S).txt"
+    {
+        echo "RAPPORT DE DIAGNOSTIC JEEHELP"
+        echo "Généré le $(date '+%Y-%m-%d %H:%M:%S') sur $(hostname) (Jeedom ${jv:-?})"
+        echo
+        echo "SYNTHÈSE : ${nerr} erreur(s), ${nwarn} avertissement(s)"
+        if [[ ${#_R_ISSUES[@]} -eq 0 ]]; then
+            echo "  Aucun élément bloquant détecté."
+        else
+            for it in "${_R_ISSUES[@]}"; do
+                [[ "${it}" == ERR* ]] || continue
+                IFS='|' read -r _ lab det <<< "${it}"; echo "  [ERR]  ${lab} : ${det}"
+            done
+            for it in "${_R_ISSUES[@]}"; do
+                [[ "${it}" == WARN* ]] || continue
+                IFS='|' read -r _ lab det <<< "${it}"; echo "  [WARN] ${lab} : ${det}"
+            done
+        fi
+        cat "${_R_BODY}"
+        echo
+        echo "Fin du rapport."
+    } > "${_R_BODY}.final"
+    rm -f "${_R_BODY}"
+    # noclobber : ne suit jamais un lien symbolique préexistant (log/ est écrit par www-data)
+    if ( set -C; cat "${_R_BODY}.final" > "${file}" ) 2>/dev/null; then
+        chown www-data:www-data "${file}" 2>/dev/null; chmod 640 "${file}"
+        ls -t "${LOG_DIR}"/jeehelp_rapport_*.txt 2>/dev/null | tail -n +11 | xargs -r rm -f
+        log_action "RAPPORT généré : ${file} (${nerr} erreur(s), ${nwarn} avertissement(s))"
+    else
+        file=""
+        log_action "RAPPORT : écriture impossible dans ${LOG_DIR}"
+    fi
+    if [[ "${mode}" == "cli" || ! -t 1 ]]; then
+        cat "${_R_BODY}.final"
+        [[ -n "${file}" ]] && echo "Rapport enregistré : ${file}"
+    else
+        if command -v less &>/dev/null; then less -FRX -P"Rapport de diagnostic (flèches/espace pour défiler, q pour quitter)" "${_R_BODY}.final"; else cat "${_R_BODY}.final"; fi
+        [[ -n "${file}" ]] && echo -e "\n${G}Rapport enregistré : ${file}${N}"
+    fi
+    rm -f "${_R_BODY}.final"
+    [[ ${nerr} -gt 0 ]] && return 2
+    [[ ${nwarn} -gt 0 ]] && return 1
+    return 0
+}
+
+menu_report() {
+    header; section "Rapport de diagnostic"
+    echo -e "  ${DIM}Collecte en cours (30 s environ)...${N}"
+    generate_report interactive
+    pause
+}
+
+# ============================================================
 #  MODE CLI NON-INTERACTIF
 # ============================================================
 
@@ -1477,6 +1796,9 @@ cli_mode() {
             echo "[CLI] Health check complet..."
             show_health "cli"
             rc=$? ;;
+        --report)
+            generate_report cli
+            rc=$? ;;
         --fix-perms)
             echo "[CLI] Rétablissement des droits..."
             fix_permissions "cli"
@@ -1497,6 +1819,7 @@ cli_mode() {
             echo "  --repair-db         Réparer la base de données"
             echo "  --check             Vérification rapide (code retour : 0 OK, 1 anomalie)"
             echo "  --health            Health check complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
+            echo "  --report            Rapport de diagnostic complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
             exit 1 ;;
@@ -1519,6 +1842,7 @@ main_menu() {
         "🌐  Réseau & SSL"
         "🔄  Mises à jour & sécurité"
         "🧹  Nettoyage"
+        "📝  Générer un rapport de diagnostic"
         "🆘  Mode secours (interface web injoignable)"
         "❌  Quitter"
     )
@@ -1526,7 +1850,7 @@ main_menu() {
     while true; do
         nav_menu "Menu principal" "${opts[@]}"
         case $MENU_RESULT in
-            -1|10) _exit_clean ;;
+            -1|11) _exit_clean ;;
             0) show_system_info ;;
             1) menu_health      ;;
             2) menu_backups     ;;
@@ -1536,7 +1860,8 @@ main_menu() {
             6) menu_network     ;;
             7) menu_updates     ;;
             8) menu_cleanup     ;;
-            9) menu_rescue      ;;
+            9) menu_report      ;;
+            10) menu_rescue     ;;
         esac
     done
 }
