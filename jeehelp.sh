@@ -1084,6 +1084,132 @@ menu_cleanup() {
 }
 
 # ============================================================
+#  10 — MODE SECOURS (si l'UI web est injoignable)
+# ============================================================
+#  Reproduit les actions exposées par Jeedom lui-même en mode secours
+#  (index.php?v=d&p=database&rescue=1 / p=cron&rescue=1), pour les cas où
+#  cette page web n'est elle-même pas joignable (Apache/PHP bloqué, plugin
+#  qui fait planter tout le rendu normal, etc.) :
+#    - "Désactiver tous les plugins" = commande rapide exacte de database.php
+#      (UPDATE `config` SET `value`=0 WHERE `key`='active')
+#    - "Activer/Désactiver le système cron" = bouton exact de cron.php
+#      (config::save('enableCron', 0|1))
+#  Chaque action est journalisée à la fois dans l'audit jeehelp et dans
+#  ${JEEDOM_DIR}/log, pour rester visible depuis l'interface Jeedom une
+#  fois celle-ci de nouveau joignable.
+
+_rescue_log() {
+    local msg="$1"
+    local line; line="$(date '+%Y-%m-%d %H:%M:%S') [$(whoami)] ${msg}"
+    echo "${line}" >> "${LOG_DIR}/jeehelp_rescue.log" 2>/dev/null
+    log_action "RESCUE: ${msg}"
+}
+
+_rescue_test_url() {
+    header; section "Test de la page de secours web"
+    local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    local -a hosts=("127.0.0.1")
+    [[ -n "$ip" && "$ip" != "127.0.0.1" ]] && hosts+=("${ip}")
+    local path="/index.php?v=d&p=database&rescue=1"
+    echo -e "  ${W}Page testée :${N} ${path}\n"
+
+    local h code reachable_any=0
+    for h in "${hosts[@]}"; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://${h}${path}" 2>/dev/null)
+        if [[ "${code}" == "200" ]]; then
+            echo -e "  ${G}✔${N} http://${h}${path}  →  HTTP ${code}"
+            reachable_any=1
+        elif [[ -n "${code}" && "${code}" != "000" ]]; then
+            echo -e "  ${Y}⚠${N} http://${h}${path}  →  HTTP ${code} (pas 200)"
+        else
+            echo -e "  ${R}✘${N} http://${h}${path}  →  injoignable"
+        fi
+    done
+
+    echo
+    if [[ ${reachable_any} -eq 1 ]]; then
+        echo -e "  ${G}La page de secours web est accessible : privilégier le navigateur.${N}"
+    else
+        echo -e "  ${R}Page de secours web injoignable depuis cette machine.${N}"
+        echo -e "  ${Y}→  Utiliser les actions CLI ci-dessous (Plugins / Cron).${N}"
+    fi
+    _rescue_log "Test page de secours web : $( [[ ${reachable_any} -eq 1 ]] && echo "OK" || echo "INJOIGNABLE" )"
+    pause
+}
+
+_rescue_disable_plugins() {
+    header; section "Désactiver tous les plugins (mode secours)"
+    load_mysql_creds
+    local before; before=$(mysql_cmd -N -e "SELECT COUNT(*) FROM config WHERE \`key\`='active' AND \`value\`='1';")
+    echo -e "  Reproduit exactement la commande rapide Jeedom (page Database, mode secours) :"
+    echo -e "  ${DIM}UPDATE \`config\` SET \`value\`=0 WHERE \`key\`='active';${N}"
+    echo -e "  Plugins actuellement actifs : ${W}${before:-?}${N}\n"
+    echo -e "  ${R}⚠  Utile si un plugin bloque le rendu de l'interface web.${N}"
+    echo -e "  ${Y}   Réactivation ensuite au cas par cas depuis l'interface Jeedom${N}"
+    echo -e "  ${Y}   normale (Plugins) une fois le problème identifié.${N}\n"
+
+    confirm "Désactiver les ${before:-0} plugin(s) actif(s)" || { echo -e "${Y}Annulé.${N}"; pause; return; }
+
+    if mysql_cmd -e "UPDATE \`config\` SET \`value\`=0 WHERE \`key\`='active';"; then
+        echo -e "\n${G}✔ ${before:-0} plugin(s) désactivé(s).${N}"
+        _rescue_log "Plugins désactivés (${before:-0} actifs avant action)"
+    else
+        echo -e "\n${R}✘ Erreur lors de la désactivation.${N}"
+        _rescue_log "ÉCHEC désactivation plugins"
+    fi
+    pause
+}
+
+_rescue_cron_state() {
+    local v; v=$(mysql_cmd -N -e "SELECT \`value\` FROM config WHERE plugin='core' AND \`key\`='enableCron';")
+    [[ -z "${v}" || "${v}" == "1" ]] && echo "actif" || echo "désactivé"
+}
+
+_rescue_set_cron() {
+    local state="$1" label="$2"
+    header; section "${label} (mode secours)"
+    load_mysql_creds
+    echo -e "  Reproduit exactement le bouton Jeedom « ${label} » (page Cron, mode secours) :"
+    echo -e "  ${DIM}config::save('enableCron', ${state})${N}"
+    echo -e "  État actuel : ${W}$(_rescue_cron_state)${N}\n"
+
+    confirm "${label}" || { echo -e "${Y}Annulé.${N}"; pause; return; }
+
+    if mysql_cmd -e "REPLACE INTO config (plugin, \`key\`, \`value\`) VALUES ('core','enableCron','${state}');"; then
+        if [[ "${state}" == "0" ]]; then
+            echo -e "\n${G}✔ Système cron désactivé.${N}"
+        else
+            echo -e "\n${G}✔ Système cron activé.${N}"
+        fi
+        _rescue_log "${label} (enableCron=${state})"
+    else
+        echo -e "\n${R}✘ Erreur.${N}"
+        _rescue_log "ÉCHEC ${label}"
+    fi
+    pause
+}
+
+menu_rescue() {
+    local opts=(
+        "🔗  Tester l'accès à la page de secours web"
+        "🧩  Désactiver tous les plugins"
+        "⏱️   Désactiver le système cron"
+        "⏱️   Activer le système cron"
+        "↩  Retour"
+    )
+    while true; do
+        nav_menu "Mode secours (si l'interface web est injoignable)" "${opts[@]}"
+        case $MENU_RESULT in
+            -1|4) return ;;
+            0) _rescue_test_url ;;
+            1) _rescue_disable_plugins ;;
+            2) _rescue_set_cron 0 "Désactiver le système cron" ;;
+            3) _rescue_set_cron 1 "Activer le système cron" ;;
+        esac
+    done
+}
+
+# ============================================================
 #  MODE CLI NON-INTERACTIF
 # ============================================================
 
@@ -1151,13 +1277,14 @@ main_menu() {
         "🌐  Réseau & SSL"
         "🔄  Mises à jour & sécurité"
         "🧹  Nettoyage"
+        "🆘  Mode secours (interface web injoignable)"
         "❌  Quitter"
     )
 
     while true; do
         nav_menu "Menu principal" "${opts[@]}"
         case $MENU_RESULT in
-            -1|9) _exit_clean ;;
+            -1|10) _exit_clean ;;
             0) show_system_info ;;
             1) menu_health      ;;
             2) menu_backups     ;;
@@ -1167,6 +1294,7 @@ main_menu() {
             6) menu_network     ;;
             7) menu_updates     ;;
             8) menu_cleanup     ;;
+            9) menu_rescue      ;;
         esac
     done
 }
