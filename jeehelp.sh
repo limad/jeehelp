@@ -1288,7 +1288,7 @@ _unattended_setup() {
     _unatd_set "$conf" '//Unattended-Upgrade::Remove-New-Unused-Dependencies "true";' 'Unattended-Upgrade::Remove-New-Unused-Dependencies "true";' || failed=1
     _unatd_set "$conf" '//Unattended-Upgrade::Remove-Unused-Dependencies "false";'    'Unattended-Upgrade::Remove-Unused-Dependencies "true";'     || failed=1
     if [[ $failed -eq 0 ]]; then
-        echo -e "\n${G}✔ Configuré — reboot à 5h UTC si patch kernel nécessaire.${N}"
+        echo -e "\n${G}✔ Configuré — redémarrage automatique à 05h00 (heure locale du serveur) si une mise à jour du noyau l'exige.${N}"
         log_action "unattended-upgrades configuré"
     else
         echo -e "\n${R}✘ Configuration incomplète — voir les échecs ci-dessus.${N}"
