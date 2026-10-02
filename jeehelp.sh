@@ -294,8 +294,12 @@ mysql_cmd() {
 # actives) : un service installé mais jamais démarré depuis le boot n'y
 # apparaît pas et serait déclaré "absent" à tort. `list-unit-files` liste
 # toutes les unités présentes sur le disque, quel que soit leur état.
+# Les alias sont exclus (ex: mysql.service -> mariadb.service) : sinon
+# MariaDB apparaîtrait deux fois et "Redémarrer MySQL/MariaDB" le
+# redémarrerait deux fois.
 _svc_exists() {
-    systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${1}\.service"
+    systemctl list-unit-files --type=service 2>/dev/null \
+        | awk -v u="${1}.service" '$1==u && $2!="alias" {f=1} END{exit !f}'
 }
 
 svc_ctl() {
@@ -326,14 +330,16 @@ _jee_php_env() {
     sudo -u www-data env "${envassign}" php -r "require '${CORE_INC}'; ${code}" 2>&1
 }
 
-#  État du master jeeCron — remplace pgrep -f "jeedom.php" (fichier
-#  inexistant en 4.6, donc le pgrep ne matchait jamais). Réplique exactement
-#  la détection native cron::jeeCronRun() (lit le PID dans
-#  jeedom::getTmpFolder().'/jeeCron.pid' et vérifie que le process est
-#  vivant via posix_getsid), telle qu'utilisée par core/php/jeeCron.php
-#  lui-même avant de devenir master.
+#  État du moteur cron Jeedom. Sur 4.6, jeeCron.php n'est PAS un daemon
+#  persistant : /etc/cron.d/jeedom le lance chaque minute, il écrit son PID
+#  dans jeedom::getTmpFolder().'/jeeCron.pid', exécute les tâches dues puis
+#  se termine. cron::jeeCronRun() (PID vivant) n'est donc vrai que pendant
+#  ces quelques secondes, et seul il rapportait "introuvable" à tort. Le
+#  moteur est considéré actif si un run est en cours OU si le PID file a été
+#  réécrit il y a moins de 120 s (au moins un passage dans la dernière
+#  minute écoulée).
 _daemon_running() {
-    sudo -u www-data php -r "require '${CORE_INC}'; exit(cron::jeeCronRun() ? 0 : 1);" 2>/dev/null
+    sudo -u www-data php -r "require '${CORE_INC}'; \$p = jeedom::getTmpFolder() . '/jeeCron.pid'; exit((cron::jeeCronRun() || (is_file(\$p) && time() - filemtime(\$p) < 120)) ? 0 : 1);" 2>/dev/null
 }
 
 check_root()   { [[ $EUID -ne 0 ]] && { echo -e "${R}Lancer en root (sudo).${N}"; exit 1; }; }
