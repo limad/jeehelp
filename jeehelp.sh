@@ -60,11 +60,13 @@ _exit_signal() {
     exit "${code}"
 }
 
+declare -ga _TMP_CLEAN=()
+
 _cleanup_optfile() {
     [[ -n "${DB_OPTFILE:-}" && -f "${DB_OPTFILE}" ]] && rm -f "${DB_OPTFILE}"
 }
 
-_on_exit() { _cursor_show; _cleanup_optfile; }
+_on_exit() { _cursor_show; _cleanup_optfile; [[ ${#_TMP_CLEAN[@]} -gt 0 ]] && rm -rf -- "${_TMP_CLEAN[@]}" 2>/dev/null; }
 
 trap '_exit_signal 130' INT
 trap '_exit_signal 143' TERM
@@ -1323,23 +1325,23 @@ menu_cleanup() {
 #  ${JEEDOM_DIR}/log, pour rester visible depuis l'interface Jeedom une
 #  fois celle-ci de nouveau joignable.
 
+# Ajoute une ligne SANS jamais suivre un lien symbolique : ouverture en O_NOFOLLOW
+# (un test -L suivi d'un >> laisserait une fenêtre TOCTOU, log/ étant modifiable
+# par www-data). Création en www-data 664 comme les autres logs Jeedom.
+_safe_append() {  # fichier ligne
+    perl -MFcntl -e '
+my ($f, $l) = @ARGV;
+sysopen(my $h, $f, O_WRONLY|O_APPEND|O_CREAT|O_NOFOLLOW, 0664) or exit 1;
+my @pw = getpwnam("www-data"); chown $pw[2], $pw[3], $h if @pw; chmod 0664, $h;
+syswrite($h, $l . "\n"); close $h;' "$1" "$2"
+}
+
 _rescue_log() {
     local msg="$1"
     local line; line="$(date '+%Y-%m-%d %H:%M:%S') [$(whoami)] ${msg}"
     local target="${LOG_DIR}/jeehelp_rescue.log"
-    # ${LOG_DIR} appartient à www-data (comme tout core Jeedom) : un process
-    # www-data compromis pourrait y remplacer ce fichier par un lien
-    # symbolique vers une cible root arbitraire. root suivrait ce lien à
-    # l'`>>` suivant et y ajouterait la ligne de log. -L teste le lien
-    # lui-même (pas sa cible), donc ce test détecte le cas même si la cible
-    # du lien n'existe pas encore.
-    if [[ -L "${target}" ]] || { [[ -e "${target}" ]] && [[ ! -f "${target}" ]]; }; then
-        log_action "RESCUE-LOG-ALERTE: ${target} n'est pas un fichier régulier (lien symbolique ?) — écriture refusée"
-    else
-        # Même propriétaire/droits que les autres logs Jeedom (visible depuis l'UI).
-        [[ -e "${target}" ]] || { : > "${target}" && chown www-data:www-data "${target}" && chmod 664 "${target}"; } 2>/dev/null
-        echo "${line}" >> "${target}" 2>/dev/null
-    fi
+    _safe_append "${target}" "${line}" 2>/dev/null \
+        || log_action "RESCUE-LOG-ALERTE: écriture refusée dans ${target} (lien symbolique ou erreur)"
     log_action "RESCUE: ${msg}"
 }
 
@@ -1740,6 +1742,8 @@ generate_report() {
         echo "Fin du rapport."
     } > "${_R_BODY}.final"
     rm -f "${_R_BODY}"
+    # Le texte libre (messages Jeedom, lignes de log) peut contenir un secret : masqué avant d'être persisté
+    _ai_prepare "${_R_BODY}.final" "${_R_BODY}.red" /dev/null local 1 2>/dev/null && mv "${_R_BODY}.red" "${_R_BODY}.final"
     # noclobber : ne suit jamais un lien symbolique préexistant (log/ est écrit par www-data)
     if ( set -C; cat "${_R_BODY}.final" > "${file}" ) 2>/dev/null; then
         chown www-data:www-data "${file}" 2>/dev/null; chmod 640 "${file}"
@@ -1826,10 +1830,19 @@ _ai_conf_add() {  # clé valeur : ajoute une valeur à une liste séparée par d
       mv "${AI_CONF}.tmp" "${AI_CONF}"; chmod 600 "${AI_CONF}" )
 }
 
-_ai_url_scope() {  # URL → local|cloud
-    local h; h=$(sed -E 's#^[a-z]+://([^/:]+).*#\1#' <<< "$1")
-    [[ "${h}" =~ ^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) || "${h}" == *.local || "${h}" == *.lan ]] \
-        && echo local || echo cloud
+_ai_url_scope() {  # URL → local|cloud (hôte EXACT ; au moindre doute : cloud)
+    local u="$1" h
+    [[ "${u}" =~ ^https?://([^/@?#]*@)?(\[[0-9a-fA-F:]+\]|[^/:?#]+)(:[0-9]+)?([/?#]|$) ]] || { echo cloud; return; }
+    [[ -n "${BASH_REMATCH[1]}" ]] && { echo cloud; return; }      # userinfo : ambigu
+    h="${BASH_REMATCH[2]}"
+    if [[ "${h}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        local a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]})) c=$((10#${BASH_REMATCH[3]})) d=$((10#${BASH_REMATCH[4]}))
+        if (( a > 255 || b > 255 || c > 255 || d > 255 )); then echo cloud
+        elif (( a == 127 || a == 10 || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31) )); then echo local
+        else echo cloud; fi
+    elif [[ "${h,,}" == localhost || "${h}" == "[::1]" ]]; then echo local
+    elif [[ "${h,,}" =~ ^[a-z0-9-]+(\.[a-z0-9-]+)*\.(local|lan)$ ]]; then echo local
+    else echo cloud; fi
 }
 
 # Masque les secrets ; en mode cloud anonymise aussi (IP, MAC, hôte, chemins)
@@ -1846,11 +1859,12 @@ my @o;
 for my $l (@lines) {
   next if $mode eq "cloud" && !$logs && $l =~ /^ {10}\S/;
   $l =~ s/\b(Bearer|Basic)\s+\S+/$1 [REDACTED]/g;
-  $l =~ s/(api[_-]?key|token|secret|passw(?:or)?d|authorization)(\s*[=:]\s*)\S+/$1$2\[REDACTED]/ig;
+  $l =~ s/(api[_-]?key|token|secret|passw(?:or)?d|authorization)("?\s*[=:]\s*"?)[^\s"}]+/$1$2\[REDACTED]/ig;
   $l =~ s/\bsk-[A-Za-z0-9_-]{16,}/[REDACTED]/g;
   $l =~ s/\b[A-Za-z0-9+=_-]{40,}\b/[REDACTED]/g;
   if ($mode eq "cloud") {
-    $l =~ s/\b((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})\b/tok("MAC",$1)/ge;
+    $l =~ s/\b((?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2})\b/tok("MAC",$1)/ge;
+    $l =~ s{/home/[^/\s]+}{/home/USER}g;
     $l =~ s/\b((?:\d{1,3}\.){3}\d{1,3})\b/tok("IP",$1)/ge;
     $l =~ s/(?<![0-9A-Za-z:])((?=[0-9a-fA-F:]*[a-fA-F])[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){2,7})(?![0-9A-Za-z:])/tok("IP6",$1)/ge;
     $l =~ s/\Q$host\E/HOST/g if length $host;
@@ -1943,6 +1957,23 @@ _ai_render() {  # réponse_brute texte_sorti actions_sortie
 }
 
 # Appel direct d'une API compatible OpenAI (chat/completions)
+# Appel du CLI du plugin dans un répertoire éphémère : root le remplit, le confie à www-data,
+# n'y réécrit plus, puis relit la réponse (fichier régulier uniquement, taille bornée).
+_ai_plugin_call() {  # wd id msgfile sysfile resp scope → ligne de statut ; rc = code de timeout/php
+    local wd="$1" id="$2" msg="$3" sys="$4" resp="$5" scope="$6" sh rc
+    local -a extra=(); [[ "${scope}" == cloud ]] && extra=(--allow-cloud 1)
+    sh=$(mktemp -d); chmod 700 "${sh}"; _TMP_CLEAN+=("${sh}")
+    cp "${msg}" "${sh}/m.txt"; cp "${sys}" "${sh}/s.txt"; : > "${sh}/r.txt"
+    chown -R www-data:www-data "${sh}"
+    timeout 240 sudo -u www-data php "${AI_CLI}" ask --id "${id}" --message-file "${sh}/m.txt" \
+        --system-file "${sh}/s.txt" --out "${sh}/r.txt" "${extra[@]}" > "${wd}/status" 2>/dev/null
+    rc=$?
+    if [[ -f "${sh}/r.txt" && ! -L "${sh}/r.txt" ]]; then head -c 200000 "${sh}/r.txt" > "${resp}"; else : > "${resp}"; fi
+    rm -rf "${sh}"
+    tail -n 1 "${wd}/status"
+    return ${rc}
+}
+
 _ai_direct_call() {  # wd msgfile sysfile resp → ligne OK|...|ERR|... ; rc 0/1
     local wd="$1" url key model code
     url=$(_ai_conf_get AI_DIRECT_URL); key=$(_ai_conf_get AI_DIRECT_KEY); model=$(_ai_conf_get AI_DIRECT_MODEL)
@@ -1958,8 +1989,9 @@ _ai_direct_call() {  # wd msgfile sysfile resp → ligne OK|...|ERR|... ; rc 0/1
 }
 
 ask_ai() {
-    local wd; wd=$(mktemp -d)
-    chown www-data:www-data "${wd}"; chmod 700 "${wd}"
+    # wd reste root:root 700 : jamais de fichier root écrit dans un répertoire modifiable par www-data
+    local wd; wd=$(mktemp -d); chmod 700 "${wd}"
+    _TMP_CLEAN+=("${wd}")
     _ask_ai_run "${wd}" "$@"; local rc=$?
     rm -rf "${wd}"
     return ${rc}
@@ -2002,7 +2034,6 @@ _ask_ai_run() {
         cat "${cloud}"; return 0
     fi
     local sysf="${wd}/system.txt"; _ai_system_prompt "${sysf}"
-    chown www-data:www-data "${full}" "${cloud}" "${sysf}"; chmod 640 "${full}" "${cloud}" "${sysf}"
 
     # ── 2. Candidats : "canal|id|nom|provider|modèle|scope" ──
     local -a cands=() locals=() clouds=()
@@ -2070,10 +2101,9 @@ _ask_ai_run() {
             msgf="${full}"; mapf="${map_l}"
         fi
         echo -e "${DIM}→ ${name} (${prov}/${model}, ${scope})...${N}"
-        rm -f "${resp}"; touch "${resp}"; chown www-data:www-data "${resp}"; chmod 660 "${resp}"
+        rm -f "${resp}"
         if [[ "${ch}" == plugin ]]; then
-            status=$(timeout 240 sudo -u www-data php "${AI_CLI}" ask --id "${id}" --message-file "${msgf}" --system-file "${sysf}" --out "${resp}" 2>/dev/null | tail -1)
-            prc=${PIPESTATUS[0]}
+            status=$(_ai_plugin_call "${wd}" "${id}" "${msgf}" "${sysf}" "${resp}" "${scope}"); prc=$?
             [[ ${prc} -eq 124 ]] && status="ERR|${id}|timeout (240 s)"
         else
             status=$(_ai_direct_call "${wd}" "${msgf}" "${sysf}" "${resp}"); prc=$?
@@ -2121,11 +2151,11 @@ _ask_ai_run() {
         while IFS=$'\t' read -r -u 3 aid reason; do
             n=$((n+1))
             if [[ -z "${AI_ACTIONS[${aid}]:-}" ]]; then
-                echo -e "  ${DIM}${n}. « ${aid:0:40} » : hors catalogue, ignorée${N}"; continue
+                printf '  %b%s. « %s » : hors catalogue, ignorée%b\n' "${DIM}" "${n}" "${aid:0:40}" "${N}"; continue
             fi
             spec="${AI_ACTIONS[${aid}]}"; flag="${spec%%|*}"; risk=$(cut -d'|' -f2 <<< "${spec}"); desc="${spec#*|*|}"
             echo -e "  ${n}. ${W}${aid}${N} — ${desc} ${DIM}[${risk}]${N}"
-            echo -e "     raison de l'IA : $(_ai_deanon "${mapf}" <<< "${reason:0:200}")"
+            printf "     raison de l'IA : %s\n" "$(_ai_deanon "${mapf}" <<< "${reason:0:200}")"
             echo "     commande : jeehelp ${flag}" >> /dev/null
             if [[ ${tty} -eq 1 ]]; then
                 if confirm "     Exécuter « jeehelp ${flag} » (${risk})"; then
