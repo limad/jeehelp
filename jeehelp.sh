@@ -26,7 +26,7 @@ DIM='\033[2m'
 
 # ── Cache MySQL ──────────────────────────────────────────────
 declare -g _DB_LOADED=0
-declare -g DB_HOST DB_PORT DB_NAME DB_USER DB_PASS
+declare -g DB_HOST DB_PORT DB_NAME DB_USER DB_PASS DB_OPTFILE
 
 # ── Navigation ───────────────────────────────────────────────
 declare -g MENU_RESULT=0   # index sélectionné, -1 = ESC/retour
@@ -46,8 +46,14 @@ _exit_clean() {
     exit 0
 }
 
+_cleanup_optfile() {
+    [[ -n "${DB_OPTFILE:-}" && -f "${DB_OPTFILE}" ]] && rm -f "${DB_OPTFILE}"
+}
+
+_on_exit() { _cursor_show; _cleanup_optfile; }
+
 trap '_exit_clean' INT TERM
-trap '_cursor_show' EXIT
+trap '_on_exit' EXIT
 
 # ============================================================
 #  HELPERS GÉNÉRIQUES
@@ -143,10 +149,13 @@ nav_menu() {
 
         case "$KEY_RESULT" in
             up)
-                [[ $sel -gt 0 ]] && ((sel--)) || sel=$((total - 1))
+                # Affectation arithmétique (jamais un post-/pré-incrément ((…))) :
+                # ((sel++)) renvoie la valeur AVANT incrément comme statut de sortie,
+                # donc un sel=0 fait échouer le && et déclenche aussi le || qui suit.
+                [[ $sel -gt 0 ]] && sel=$((sel - 1)) || sel=$((total - 1))
                 ;;
             down)
-                [[ $sel -lt $((total - 1)) ]] && ((sel++)) || sel=0
+                [[ $sel -lt $((total - 1)) ]] && sel=$((sel + 1)) || sel=0
                 ;;
             pgup) sel=0 ;;
             pgdn) sel=$((total - 1)) ;;
@@ -207,18 +216,41 @@ pick_file_nav() {
 
 load_mysql_creds() {
     [[ $_DB_LOADED -eq 1 ]] && return
-    DB_HOST=$(grep "db:host"     "${CONF_FILE}" | sed "s/.*=> *'\(.*\)'.*/\1/")
-    DB_PORT=$(grep "db:port"     "${CONF_FILE}" | sed "s/.*=> *'\(.*\)'.*/\1/")
-    DB_NAME=$(grep "db:dbname"   "${CONF_FILE}" | sed "s/.*=> *'\(.*\)'.*/\1/")
-    DB_USER=$(grep "db:username" "${CONF_FILE}" | sed "s/.*=> *'\(.*\)'.*/\1/")
-    DB_PASS=$(grep "db:password" "${CONF_FILE}" | sed "s/.*=> *'\(.*\)'.*/\1/")
+    # Lu via PHP natif (require du fichier de config réel) plutôt que grep/sed :
+    # le format ('db' => array('host' => ...)) est un tableau PHP imbriqué,
+    # pas des clés plates 'db:host', et un parsing texte fragile se désynchronise
+    # silencieusement à chaque évolution du format core.
+    local raw
+    raw=$(CONF_FILE_PATH="${CONF_FILE}" php -r '
+        $CONFIG = [];
+        $f = getenv("CONF_FILE_PATH");
+        if ($f && is_file($f)) { require $f; }
+        $db = $CONFIG["db"] ?? [];
+        echo ($db["host"] ?? "") . "\x1f";
+        echo ($db["port"] ?? "") . "\x1f";
+        echo ($db["dbname"] ?? "") . "\x1f";
+        echo ($db["username"] ?? "") . "\x1f";
+        echo ($db["password"] ?? "");
+    ' 2>/dev/null)
+    IFS=$'\x1f' read -r DB_HOST DB_PORT DB_NAME DB_USER DB_PASS <<< "${raw}"
     DB_PORT=${DB_PORT:-3306}
+    # Fichier d'options temporaire (0600) : évite d'exposer le mot de passe
+    # dans la liste des processus (ps) via -p<pass> en argument.
+    DB_OPTFILE=$(mktemp)
+    chmod 600 "${DB_OPTFILE}"
+    {
+        echo "[client]"
+        echo "host=${DB_HOST}"
+        echo "port=${DB_PORT}"
+        echo "user=${DB_USER}"
+        echo "password=${DB_PASS}"
+    } > "${DB_OPTFILE}"
     _DB_LOADED=1
 }
 
 mysql_cmd() {
     load_mysql_creds
-    mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASS}" "${DB_NAME}" "$@" 2>/dev/null
+    mysql --defaults-extra-file="${DB_OPTFILE}" "${DB_NAME}" "$@" 2>/dev/null
 }
 
 svc_ctl() {
@@ -309,14 +341,16 @@ declare -g _H_OK=0 _H_WARN=0 _H_ERR=0
 _chk() {
     local label="$1" status="$2" msg="$3"
     case "$status" in
-        ok)   printf "  ${G}✔${N}  %-28s %s\n" "${label}" "${msg}"; ((_H_OK++)) ;;
-        warn) printf "  ${Y}⚠${N}  %-28s %s\n" "${label}" "${msg}"; ((_H_WARN++)) ;;
-        err)  printf "  ${R}✘${N}  %-28s %s\n" "${label}" "${msg}"; ((_H_ERR++)) ;;
+        ok)   printf "  ${G}✔${N}  %-28s %s\n" "${label}" "${msg}"; _H_OK=$((_H_OK + 1)) ;;
+        warn) printf "  ${Y}⚠${N}  %-28s %s\n" "${label}" "${msg}"; _H_WARN=$((_H_WARN + 1)) ;;
+        err)  printf "  ${R}✘${N}  %-28s %s\n" "${label}" "${msg}"; _H_ERR=$((_H_ERR + 1)) ;;
     esac
 }
 
 show_health() {
-    header; section "Vérification générale"
+    local mode="${1:-interactive}"
+    [[ "$mode" == "interactive" ]] && header
+    section "Vérification générale"
     _H_OK=0; _H_WARN=0; _H_ERR=0
 
     # ── PHP ──
@@ -448,63 +482,67 @@ show_health() {
         echo -e "  ${Y}→  Pensez à utiliser « Rétablissement des droits »${N}"
         echo -e "     ${Y}si des erreurs de permissions sont signalées.${N}"
     fi
-    pause
+    [[ "$mode" == "interactive" ]] && pause
+    [[ $_H_ERR -gt 0 ]] && return 2
+    [[ $_H_WARN -gt 0 ]] && return 1
+    return 0
 }
 
 # ── Rétablissement des droits ────────────────────────────────
 
+#  Reproduit le comportement natif de jeedom::cleanFileSystemRight()
+#  (bouton "Rétablissement des droits" du core) : chown www-data,
+#  chmod 775 récursif (y compris fichiers cachés), 665 sur les logs.
+#  Chaque étape est vérifiée ; le succès n'est annoncé que si tout a réussi.
 fix_permissions() {
-    header; section "Rétablissement des droits"
-    echo -e "  Cible : ${W}${JEEDOM_DIR}${N}"
-    echo -e "  Cette opération applique les permissions Jeedom standard.\n"
-    echo -e "  ${W}Droits appliqués :${N}"
-    echo -e "  • Propriétaire  : ${C}www-data:www-data${N} (récursif)"
-    echo -e "  • Dossiers      : ${C}755${N}"
-    echo -e "  • Fichiers      : ${C}644${N}"
-    echo -e "  • log/backup/tmp/cache : ${C}775${N}"
-    echo -e "  • Scripts .sh   : ${C}755${N}"
-    echo -e "  • jeedom.php CLI: ${C}755${N}"
-    echo
-
-    confirm "Appliquer les droits Jeedom standard" || { echo -e "${Y}Annulé.${N}"; pause; return; }
-    echo
+    local mode="${1:-interactive}"
+    [[ "$mode" == "interactive" ]] && { header; section "Rétablissement des droits"
+        echo -e "  Cible : ${W}${JEEDOM_DIR}${N}"
+        echo -e "  Reproduit le comportement natif Jeedom (bouton core « Rétablir les droits »).\n"
+        echo -e "  ${W}Droits appliqués :${N}"
+        echo -e "  • Propriétaire : ${C}www-data:www-data${N} (récursif)"
+        echo -e "  • Tout         : ${C}775${N} (récursif, y compris fichiers cachés)"
+        echo -e "  • log/*        : ${C}665${N}"
+        echo
+        confirm "Appliquer les droits Jeedom standard" || { echo -e "${Y}Annulé.${N}"; pause; return 1; }
+        echo
+    }
 
     local -a steps=(
         "Propriétaire www-data:www-data (récursif)"
-        "Dossiers chmod 755"
-        "Fichiers chmod 644"
-        "log / backup / tmp / cache : chmod 775"
-        "Scripts shell (.sh) : chmod 755"
-        "jeedom.php CLI : chmod 755"
+        "chmod 775 récursif"
+        "Fichiers cachés : chmod 775 récursif"
+        "log/*.* : chmod 665"
     )
     local -a cmds=(
-        "chown -R www-data:www-data '${JEEDOM_DIR}'"
-        "find '${JEEDOM_DIR}' -type d -exec chmod 755 {} +"
-        "find '${JEEDOM_DIR}' -type f -exec chmod 644 {} +"
-        "_fix_var_dirs"
-        "find '${JEEDOM_DIR}' -name '*.sh' -exec chmod 755 {} +"
-        "find '${JEEDOM_DIR}' -path '*/php/jeedom.php' -exec chmod 755 {} +"
+        "chown -R www-data:www-data -- '${JEEDOM_DIR}'"
+        "find '${JEEDOM_DIR}' -mindepth 1 ! -path '*/.*' -exec chmod 775 {} +"
+        "find '${JEEDOM_DIR}' -mindepth 1 -path '*/.*' -exec chmod 775 {} +"
+        "find '${JEEDOM_DIR}/log' -type f -exec chmod 665 {} +"
     )
 
-    local i
+    local i failed=0
     for i in "${!steps[@]}"; do
-        echo -ne "  ${DIM}${steps[$i]}...${N} "
-        if [[ "${cmds[$i]}" == "_fix_var_dirs" ]]; then
-            local ok=true
-            for d in log backup tmp cache; do
-                [[ -d "${JEEDOM_DIR}/${d}" ]] \
-                    && chmod -R 775 "${JEEDOM_DIR}/${d}" 2>/dev/null \
-                    || true
-            done
+        [[ "$mode" == "interactive" ]] && echo -ne "  ${DIM}${steps[$i]}...${N} "
+        if eval "${cmds[$i]}" 2>/dev/null; then
+            [[ "$mode" == "interactive" ]] && echo -e "${G}✔${N}"
         else
-            eval "${cmds[$i]}" 2>/dev/null || true
+            [[ "$mode" == "interactive" ]] && echo -e "${R}✘${N}"
+            failed=1
+            log_action "fix_permissions ÉCHEC: ${steps[$i]}"
         fi
-        echo -e "${G}✔${N}"
     done
 
-    echo -e "\n${G}✔ Droits rétablis avec succès.${N}"
-    log_action "fix_permissions exécuté"
-    pause
+    if [[ $failed -eq 0 ]]; then
+        [[ "$mode" == "interactive" ]] && echo -e "\n${G}✔ Droits rétablis avec succès.${N}"
+        log_action "fix_permissions exécuté avec succès"
+    else
+        [[ "$mode" == "interactive" ]] && echo -e "\n${R}✘ Une ou plusieurs étapes ont échoué — voir ${AUDIT_LOG}${N}"
+        log_action "fix_permissions terminé avec erreurs"
+    fi
+
+    [[ "$mode" == "interactive" ]] && pause
+    return $failed
 }
 
 # Sous-menu santé
@@ -654,16 +692,24 @@ menu_database() {
 }
 
 _db_all_tables() {
-    local cmd="$1"
-    header; section "${cmd} TABLE"
+    local cmd="$1" mode="${2:-interactive}"
+    [[ "$mode" == "interactive" ]] && { header; section "${cmd} TABLE"; }
     echo -e "${Y}${cmd} en cours...${N}\n"
+    local failed=0
     while IFS= read -r tbl; do
         local res; res=$(mysql_cmd -N -e "${cmd} TABLE \`${tbl}\`;" | awk '{print $NF}')
         printf "  %-35s %s\n" "${tbl}" "${res}"
+        [[ "${res}" == "OK" || "${res}" == "status" ]] || failed=1
     done < <(mysql_cmd -N -e "SHOW TABLES;")
-    echo -e "\n${G}✔ ${cmd} terminé.${N}"
-    log_action "DB ${cmd}"
-    pause
+    if [[ $failed -eq 0 ]]; then
+        echo -e "\n${G}✔ ${cmd} terminé.${N}"
+        log_action "DB ${cmd}"
+    else
+        echo -e "\n${Y}⚠ ${cmd} terminé avec au moins une table en anomalie.${N}"
+        log_action "DB ${cmd} (anomalies détectées)"
+    fi
+    [[ "$mode" == "interactive" ]] && pause
+    return $failed
 }
 
 _db_sizes() {
@@ -681,7 +727,7 @@ _db_sizes() {
 _db_mysqlcheck() {
     header; section "mysqlcheck --auto-repair"
     load_mysql_creds
-    mysqlcheck -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASS}" \
+    mysqlcheck --defaults-extra-file="${DB_OPTFILE}" \
                --auto-repair --check "${DB_NAME}" 2>/dev/null
     echo -e "\n${G}✔ Terminé.${N}"
     log_action "DB mysqlcheck"
@@ -693,11 +739,16 @@ _db_dump() {
     load_mysql_creds
     local file="${BACKUP_DIR}/dump_${DB_NAME}_$(date +%Y%m%d-%H%M%S).sql.gz"
     echo -e "${Y}Dump vers : $(basename "${file}")${N}"
-    mysqldump -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASS}" \
-              "${DB_NAME}" 2>/dev/null | gzip > "${file}"
-    [[ $? -eq 0 ]] \
-        && { echo -e "${G}✔ Dump créé.${N}"; log_action "DB DUMP: ${file}"; } \
-        || echo -e "${R}✘ Erreur${N}"
+    # pipefail scopé au sous-shell : capture un échec de mysqldump même si gzip réussit.
+    if (set -o pipefail; mysqldump --defaults-extra-file="${DB_OPTFILE}" "${DB_NAME}" 2>/dev/null | gzip > "${file}") \
+        && gzip -t "${file}" 2>/dev/null; then
+        echo -e "${G}✔ Dump créé et intégrité vérifiée.${N}"
+        log_action "DB DUMP: ${file}"
+    else
+        rm -f "${file}"
+        echo -e "${R}✘ Erreur lors du dump (fichier incomplet supprimé).${N}"
+        log_action "DB DUMP ÉCHEC: ${file}"
+    fi
     pause
 }
 
@@ -708,12 +759,12 @@ _db_import() {
     echo -e "${R}⚠  Écrasera la base ${DB_NAME} !${N}"
     confirm "Importer $(basename "${PICKED_FILE}")" || { echo -e "${Y}Annulé.${N}"; pause; return; }
     load_mysql_creds
-    zcat "${PICKED_FILE}" \
-        | mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -p"${DB_PASS}" \
-                "${DB_NAME}" 2>/dev/null
-    [[ $? -eq 0 ]] \
-        && { echo -e "${G}✔ Import terminé.${N}"; log_action "DB IMPORT: ${PICKED_FILE}"; } \
-        || echo -e "${R}✘ Erreur${N}"
+    if (set -o pipefail; zcat "${PICKED_FILE}" \
+            | mysql --defaults-extra-file="${DB_OPTFILE}" "${DB_NAME}" 2>/dev/null); then
+        echo -e "${G}✔ Import terminé.${N}"; log_action "DB IMPORT: ${PICKED_FILE}"
+    else
+        echo -e "${R}✘ Erreur${N}"
+    fi
     pause
 }
 
@@ -961,6 +1012,39 @@ _unattended_status() {
 #  8 — NETTOYAGE
 # ============================================================
 
+# Nettoyage ciblé de /tmp : exclut les sockets/verrous système partagés
+# (X11, ICE, systemd-private-*) et affiche la liste avant toute suppression —
+# /tmp est partagé avec d'autres services, pas une zone propre à Jeedom.
+_cleanup_tmp() {
+    header; section "Nettoyage /tmp"
+    local -a targets
+    mapfile -t targets < <(find /tmp -mindepth 1 -maxdepth 1 -mtime +1 \
+        -not -name ".X11-unix" -not -name ".ICE-unix" -not -name ".font-unix" \
+        -not -name ".Test-unix" -not -name ".XIM-unix" \
+        -not -name "systemd-private-*" -not -name "snap-private-tmp" \
+        2>/dev/null)
+
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        echo -e "${G}Rien à nettoyer (hors sockets système protégés).${N}"
+        pause; return
+    fi
+
+    echo -e "  ${W}Éléments ciblés (> 1 jour, hors sockets système) :${N}\n"
+    local f
+    for f in "${targets[@]}"; do
+        printf "  %-50s %s\n" "$(basename "$f")" "$(du -sh "$f" 2>/dev/null | cut -f1)"
+    done
+    echo
+
+    confirm "Supprimer ces ${#targets[@]} élément(s)" || { echo -e "${Y}Annulé.${N}"; pause; return; }
+
+    local b; b=$(du -sh /tmp 2>/dev/null | cut -f1)
+    rm -rf -- "${targets[@]}"
+    echo -e "  Avant : ${Y}${b}${N}  →  Après : ${G}$(du -sh /tmp 2>/dev/null | cut -f1)${N}"
+    log_action "Nettoyage /tmp (${#targets[@]} éléments)"
+    pause
+}
+
 menu_cleanup() {
     local opts=(
         "🗑️   Vieilles sauvegardes (> ${MAX_BACKUPS} jours)"
@@ -986,11 +1070,7 @@ menu_cleanup() {
                             echo -e "${G}✔ Supprimés.${N}"; log_action "Old backups purged"; } \
                        || echo -e "${Y}Annulé.${N}"
                fi; pause ;;
-            1) header; section "Nettoyage /tmp"
-               local b; b=$(du -sh /tmp 2>/dev/null | cut -f1)
-               find /tmp -maxdepth 1 -mtime +1 -not -name "." -exec rm -rf {} + 2>/dev/null
-               echo -e "  Avant : ${Y}${b}${N}  →  Après : ${G}$(du -sh /tmp 2>/dev/null | cut -f1)${N}"
-               pause ;;
+            1) _cleanup_tmp ;;
             2) header; section "Espace disque"
                du -sh "${JEEDOM_DIR}/"* 2>/dev/null | sort -rh | head -10
                echo; df -h /; pause ;;
@@ -1009,14 +1089,17 @@ menu_cleanup() {
 
 cli_mode() {
     check_root; check_jeedom
+    local rc=0
     case "$1" in
         --backup)
             echo "[CLI] Sauvegarde..."
             ${PHP_CLI} action=backup 2>&1
-            log_action "CLI --backup" ;;
+            rc=$?
+            log_action "CLI --backup (rc=${rc})" ;;
         --repair-db)
             echo "[CLI] Réparation DB..."
-            _db_all_tables "REPAIR" ;;
+            _db_all_tables "REPAIR" "cli"
+            rc=$? ;;
         --check)
             echo "[CLI] Vérification système..."
             _H_OK=0; _H_WARN=0; _H_ERR=0
@@ -1024,27 +1107,33 @@ cli_mode() {
             _ssl_check "$(hostname -f 2>/dev/null || hostname)" ;;
         --health)
             echo "[CLI] Health check complet..."
-            _H_OK=0; _H_WARN=0; _H_ERR=0
-            show_health ;;
+            show_health "cli"
+            rc=$? ;;
         --fix-perms)
             echo "[CLI] Rétablissement des droits..."
-            fix_permissions ;;
+            fix_permissions "cli"
+            rc=$? ;;
         --upgrade-security)
             echo "[CLI] unattended-upgrade..."
-            command -v unattended-upgrade &>/dev/null \
-                && { unattended-upgrade --debug 2>&1; log_action "CLI --upgrade-security"; } \
-                || echo "unattended-upgrades non installé." ;;
+            if command -v unattended-upgrade &>/dev/null; then
+                unattended-upgrade --debug 2>&1
+                rc=$?
+                log_action "CLI --upgrade-security (rc=${rc})"
+            else
+                echo "unattended-upgrades non installé."
+                rc=1
+            fi ;;
         *)
             echo "Usage: sudo bash $0 [option]"
             echo "  --backup            Lancer une sauvegarde"
             echo "  --repair-db         Réparer la base de données"
             echo "  --check             Vérification rapide"
-            echo "  --health            Health check complet"
+            echo "  --health            Health check complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
             exit 1 ;;
     esac
-    exit 0
+    exit $rc
 }
 
 # ============================================================
