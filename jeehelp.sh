@@ -1280,15 +1280,29 @@ _unattended_setup() {
     local conf="/etc/apt/apt.conf.d/50unattended-upgrades"
     [[ ! -f "$conf" ]] && { echo -e "${R}Fichier conf introuvable.${N}"; pause; return; }
     echo -e "\n${Y}Application configuration recommandée (communauté Jeedom)...${N}"
+    # Redémarrage automatique : OPTIONNEL, refusé par défaut. Redémarrer une box domotique
+    # sans surveillance est risqué (daemons, scénarios, disque externe) et ne relève pas de
+    # ce script : on ne l'active que sur demande explicite.
+    local reboot=0
+    echo -e "\n${Y}⚠ Redémarrage automatique${N} : le système redémarrerait seul à 05h00 (heure locale du serveur)"
+    echo -e "  quand une mise à jour du noyau l'exige, même si des utilisateurs sont connectés."
+    echo -e "  ${DIM}Déconseillé sur une box Jeedom 24/7 ; sans cela, un redémarrage manuel reste nécessaire après un noyau.${N}"
+    confirm "Activer le redémarrage automatique" && reboot=1
     local failed=0
+    if [[ ${reboot} -eq 1 ]]; then
     _unatd_set "$conf" '//Unattended-Upgrade::Automatic-Reboot "false";'               'Unattended-Upgrade::Automatic-Reboot "true";'               || failed=1
     _unatd_set "$conf" '//Unattended-Upgrade::Automatic-Reboot-WithUsers "true";'     'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";'     || failed=1
     _unatd_set "$conf" '//Unattended-Upgrade::Automatic-Reboot-Time "02:00";'         'Unattended-Upgrade::Automatic-Reboot-Time "05:00";'         || failed=1
+    fi
     _unatd_set "$conf" '//Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";'  'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";'  || failed=1
     _unatd_set "$conf" '//Unattended-Upgrade::Remove-New-Unused-Dependencies "true";' 'Unattended-Upgrade::Remove-New-Unused-Dependencies "true";' || failed=1
     _unatd_set "$conf" '//Unattended-Upgrade::Remove-Unused-Dependencies "false";'    'Unattended-Upgrade::Remove-Unused-Dependencies "true";'     || failed=1
     if [[ $failed -eq 0 ]]; then
-        echo -e "\n${G}✔ Configuré — redémarrage automatique à 05h00 (heure locale du serveur) si une mise à jour du noyau l'exige.${N}"
+        if [[ ${reboot} -eq 1 ]]; then
+            echo -e "\n${G}✔ Configuré — redémarrage automatique à 05h00 (heure locale du serveur) si une mise à jour du noyau l'exige.${N}"
+        else
+            echo -e "\n${G}✔ Configuré — sans redémarrage automatique (un redémarrage manuel reste nécessaire après une mise à jour du noyau).${N}"
+        fi
         log_action "unattended-upgrades configuré"
     else
         echo -e "\n${R}✘ Configuration incomplète — voir les échecs ci-dessus.${N}"
