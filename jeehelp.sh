@@ -47,13 +47,27 @@ _exit_clean() {
     exit 0
 }
 
+# Sortie sur signal OS réel (INT/TERM envoyé par un superviseur ou un
+# opérateur en dehors de la lecture clavier du menu) : _exit_clean sert au
+# "Quitter" coopératif du menu et doit garder exit 0. Ici on code le retour
+# en 128+signal (convention shell standard) pour qu'un appelant/superviseur
+# puisse distinguer une interruption d'un succès.
+_exit_signal() {
+    local code="$1"
+    _cursor_show
+    stty echo 2>/dev/null
+    echo -e "\n${Y}Interrompu.${N}\n"
+    exit "${code}"
+}
+
 _cleanup_optfile() {
     [[ -n "${DB_OPTFILE:-}" && -f "${DB_OPTFILE}" ]] && rm -f "${DB_OPTFILE}"
 }
 
 _on_exit() { _cursor_show; _cleanup_optfile; }
 
-trap '_exit_clean' INT TERM
+trap '_exit_signal 130' INT
+trap '_exit_signal 143' TERM
 trap '_on_exit' EXIT
 
 # ============================================================
@@ -83,10 +97,18 @@ confirm() {
 }
 
 # ── Lecture d'une séquence clavier ──────────────────────────
-#  Retourne dans $KEY_RESULT : "up" "down" "enter" "esc" "ctrlc" ou le char
+#  Retourne dans $KEY_RESULT : "up" "down" "enter" "esc" "ctrlc" "eof" ou le char
 read_key() {
     local key seq
-    IFS= read -rsn1 key
+    # `read -n1` renvoie key="" à la fois sur un Entrée réel (il consomme le
+    # saut de ligne comme délimiteur) ET sur un EOF véritable (stdin fermé) —
+    # mais SEUL l'EOF fait échouer read (rc != 0). Sans ce test, un stdin
+    # fermé (lancement sans TTY, pipe vide) ferait boucler le menu à l'infini
+    # en traitant chaque lecture ratée comme un appui sur Entrée.
+    if ! IFS= read -rsn1 key; then
+        KEY_RESULT="eof"
+        return
+    fi
 
     case "$key" in
         $'\x1b')  # début séquence ESC
@@ -170,7 +192,7 @@ nav_menu() {
                 MENU_RESULT=-1
                 return
                 ;;
-            ctrlc|ctrld)
+            ctrlc|ctrld|eof)
                 _exit_clean
                 ;;
         esac
@@ -221,8 +243,22 @@ load_mysql_creds() {
     # le format ('db' => array('host' => ...)) est un tableau PHP imbriqué,
     # pas des clés plates 'db:host', et un parsing texte fragile se désynchronise
     # silencieusement à chaque évolution du format core.
+    # Exécuté en www-data, PAS en root : common.config.php est possédé par
+    # www-data (comme tout core Jeedom), donc modifiable par n'importe quel
+    # plugin/daemon tournant sous ce compte. Un `require` de ce fichier
+    # lancé directement par le `php` root donnerait à un www-data compromis
+    # un chemin d'exécution de code arbitraire EN ROOT au prochain appel
+    # d'une fonction MySQL de jeehelp. En le exécutant sous www-data (même
+    # compte qui possède déjà le fichier), aucune élévation de privilège
+    # n'est possible.
     local raw
-    raw=$(CONF_FILE_PATH="${CONF_FILE}" php -r '
+    # La variable d'environnement est fixée par `env`, lui-même exécuté en
+    # www-data APRÈS le changement d'utilisateur par sudo : elle n'a donc
+    # pas besoin de traverser le reset d'environnement de sudo
+    # (contrairement à `VAR=val sudo -u ... php`, où `sudo` repartirait
+    # d'un environnement nettoyé et perdrait VAR sans --preserve-env).
+    # Même pattern que _jee_php_env ci-dessus.
+    raw=$(sudo -u www-data env "CONF_FILE_PATH=${CONF_FILE}" php -r '
         $CONFIG = [];
         $f = getenv("CONF_FILE_PATH");
         if ($f && is_file($f)) { require $f; }
@@ -343,19 +379,27 @@ show_system_info() {
     pause
 }
 
+# Renvoie 0 si tout est OK, 1 si une anomalie est signalée — utilisé par
+# `--check` pour que le code de sortie CLI reflète réellement le résultat
+# (il affichait les mêmes messages mais retournait toujours 0 à l'appelant).
 _watchdog_check() {
+    local rc=0
     _daemon_running \
         && echo -e "  ${G}✔${N} Daemon Jeedom actif" \
-        || echo -e "  ${R}✘${N} Daemon Jeedom introuvable"
+        || { echo -e "  ${R}✘${N} Daemon Jeedom introuvable"; rc=1; }
     local pct; pct=$(df "${JEEDOM_DIR}" | awk 'NR==2{gsub(/%/,""); print $5}')
-    [[ $pct -ge 90 ]] \
-        && echo -e "  ${R}⚠  Disque ${pct}% utilisé !${N}" \
-        || echo -e "  ${G}✔${N} Disque ${pct}% utilisé"
+    if [[ $pct -ge 90 ]]; then
+        echo -e "  ${R}⚠  Disque ${pct}% utilisé !${N}"; rc=1
+    else
+        echo -e "  ${G}✔${N} Disque ${pct}% utilisé"
+    fi
+    return $rc
 }
 
+# Même convention de retour que _watchdog_check (0=OK, 1=anomalie).
 _ssl_check() {
     local domain="${1:-$(hostname -f)}"
-    command -v openssl &>/dev/null || { echo -e "  ${Y}openssl non disponible${N}"; return; }
+    command -v openssl &>/dev/null || { echo -e "  ${Y}openssl non disponible${N}"; return 1; }
     local expiry
     # timeout explicite : un pare-feu qui droppe sans répondre bloquerait
     # sinon s_client indéfiniment (pas de timeout par défaut côté openssl).
@@ -363,12 +407,14 @@ _ssl_check() {
              -servername "${domain}" 2>/dev/null \
              | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
     if [[ -z "$expiry" ]]; then
-        echo -e "  ${Y}Pas de HTTPS détecté sur ${domain}${N}"; return
+        echo -e "  ${Y}Pas de HTTPS détecté sur ${domain}${N}"; return 1
     fi
     local diff_days; diff_days=$(( ($(date -d "$expiry" +%s 2>/dev/null) - $(date +%s)) / 86400 ))
-    [[ $diff_days -le 14 ]] \
-        && echo -e "  ${R}⚠  SSL expire dans ${diff_days}j (${expiry})${N}" \
-        || echo -e "  ${G}✔${N} SSL valide encore ${diff_days} jours"
+    if [[ $diff_days -le 14 ]]; then
+        echo -e "  ${R}⚠  SSL expire dans ${diff_days}j (${expiry})${N}"; return 1
+    fi
+    echo -e "  ${G}✔${N} SSL valide encore ${diff_days} jours"
+    return 0
 }
 
 # ============================================================
@@ -740,12 +786,36 @@ _db_all_tables() {
     local cmd="$1" mode="${2:-interactive}"
     [[ "$mode" == "interactive" ]] && { header; section "${cmd} TABLE"; }
     echo -e "${Y}${cmd} en cours...${N}\n"
-    local failed=0
-    while IFS= read -r tbl; do
-        local res; res=$(mysql_cmd -N -e "${cmd} TABLE \`${tbl}\`;" | awk '{print $NF}')
+
+    # Capturé via substitution de commande (pas un pipe vers `while`) pour
+    # pouvoir tester le code retour de SHOW TABLES : avec `done < <(...)`,
+    # un échec de connexion MySQL produirait juste une liste vide et la
+    # boucle ne s'exécuterait pas — "terminé" aurait alors été annoncé à
+    # tort alors qu'aucune table n'a réellement été vérifiée.
+    local raw_tables
+    raw_tables=$(mysql_cmd -N -e "SHOW TABLES;")
+    if [[ $? -ne 0 ]]; then
+        echo -e "${R}✘ Impossible d'énumérer les tables (SHOW TABLES a échoué).${N}"
+        log_action "DB ${cmd} : échec SHOW TABLES"
+        [[ "$mode" == "interactive" ]] && pause
+        return 1
+    fi
+
+    local -a tables=()
+    [[ -n "${raw_tables}" ]] && mapfile -t tables <<< "${raw_tables}"
+
+    local failed=0 tbl tbl_escaped res
+    for tbl in "${tables[@]}"; do
+        # Échappe un éventuel accent grave dans le nom de table (doublé,
+        # convention MySQL) avant de le réinjecter comme identifiant entre
+        # backticks : sans ça, un nom de table contenant ` casserait la
+        # requête générée (injection SQL de second ordre).
+        tbl_escaped="${tbl//\`/\`\`}"
+        res=$(mysql_cmd -N -e "${cmd} TABLE \`${tbl_escaped}\`;" | awk '{print $NF}')
         printf "  %-35s %s\n" "${tbl}" "${res}"
         [[ "${res}" == "OK" || "${res}" == "status" ]] || failed=1
-    done < <(mysql_cmd -N -e "SHOW TABLES;")
+    done
+
     if [[ $failed -eq 0 ]]; then
         echo -e "\n${G}✔ ${cmd} terminé.${N}"
         log_action "DB ${cmd}"
@@ -772,10 +842,14 @@ _db_sizes() {
 _db_mysqlcheck() {
     header; section "mysqlcheck --auto-repair"
     load_mysql_creds
-    mysqlcheck --defaults-extra-file="${DB_OPTFILE}" \
-               --auto-repair --check "${DB_NAME}" 2>/dev/null
-    echo -e "\n${G}✔ Terminé.${N}"
-    log_action "DB mysqlcheck"
+    if mysqlcheck --defaults-extra-file="${DB_OPTFILE}" \
+               --auto-repair --check "${DB_NAME}" 2>/dev/null; then
+        echo -e "\n${G}✔ Terminé.${N}"
+        log_action "DB mysqlcheck"
+    else
+        echo -e "\n${R}✘ Erreur lors de mysqlcheck.${N}"
+        log_action "DB mysqlcheck ÉCHEC"
+    fi
     pause
 }
 
@@ -803,12 +877,26 @@ _db_import() {
     echo
     echo -e "${R}⚠  Écrasera la base ${DB_NAME} !${N}"
     confirm "Importer $(basename "${PICKED_FILE}")" || { echo -e "${Y}Annulé.${N}"; pause; return; }
+
+    # Vérification d'intégrité avant toute écriture en base : un dump SQL
+    # n'est pas transactionnel, donc même avec pipefail une partie des
+    # requêtes peut déjà avoir été appliquée avant qu'une erreur de flux ne
+    # soit détectée. gzip -t ne garantit pas la validité du SQL contenu,
+    # mais élimine la cause la plus fréquente d'import partiel (archive
+    # tronquée/corrompue) avant de toucher à la base.
+    if ! gzip -t "${PICKED_FILE}" 2>/dev/null; then
+        echo -e "${R}✘ Archive corrompue (gzip -t a échoué) — import annulé, base non touchée.${N}"
+        log_action "DB IMPORT annulé (archive corrompue) : ${PICKED_FILE}"
+        pause; return
+    fi
+
     load_mysql_creds
     if (set -o pipefail; zcat "${PICKED_FILE}" \
             | mysql --defaults-extra-file="${DB_OPTFILE}" "${DB_NAME}" 2>/dev/null); then
         echo -e "${G}✔ Import terminé.${N}"; log_action "DB IMPORT: ${PICKED_FILE}"
     else
-        echo -e "${R}✘ Erreur${N}"
+        echo -e "${R}✘ Erreur — la base peut avoir été partiellement modifiée (dump non transactionnel).${N}"
+        log_action "DB IMPORT ÉCHEC (possible état partiel) : ${PICKED_FILE}"
     fi
     pause
 }
@@ -1047,9 +1135,15 @@ menu_updates() {
                    || echo -e "${Y}Annulé.${N}"
                pause ;;
             2) header; section "apt update + upgrade"
-               apt-get update 2>&1 | tail -5
-               apt-get upgrade -y 2>&1
-               echo -e "\n${G}✔ Système à jour.${N}"; log_action "apt upgrade"; pause ;;
+               # pipefail scopé : sans lui, le `| tail -5` masquerait le code
+               # retour réel d'apt-get update (celui de `tail`, toujours 0).
+               if (set -o pipefail; apt-get update 2>&1 | tail -5) && apt-get upgrade -y 2>&1; then
+                   echo -e "\n${G}✔ Système à jour.${N}"; log_action "apt upgrade"
+               else
+                   echo -e "\n${R}✘ Échec lors de la mise à jour système (update ou upgrade).${N}"
+                   log_action "apt upgrade ÉCHEC"
+               fi
+               pause ;;
             3) _unattended_setup  ;;
             4) _unattended_dryrun ;;
             5) _unattended_status ;;
@@ -1057,32 +1151,51 @@ menu_updates() {
     done
 }
 
+#  Renvoie 0 si la directive est déjà active OU appliquée avec succès,
+#  1 si `sed` a réellement échoué — jusqu'ici la coche verte s'affichait
+#  après `sed -i` sans vérifier son code retour.
 _unatd_set() {
     local file="$1" old="$2" new="$3"
     if grep -qF "${old}" "$file" 2>/dev/null; then
-        sed -i "s|${old}|${old}\n${new}|" "$file"
-        echo -e "  ${G}✔${N} ${new}"
+        if sed -i "s|${old}|${old}\n${new}|" "$file"; then
+            echo -e "  ${G}✔${N} ${new}"
+        else
+            echo -e "  ${R}✘${N} Échec d'application : ${new}"
+            return 1
+        fi
     else
         echo -e "  ${Y}–${N} Déjà actif ou non trouvé : ${new}"
     fi
+    return 0
 }
 
 _unattended_setup() {
     header; section "Installation & configuration unattended-upgrades"
-    apt-get install -y unattended-upgrades apt-listchanges debconf-utils 2>&1
+    if ! apt-get install -y unattended-upgrades apt-listchanges debconf-utils 2>&1; then
+        echo -e "${R}✘ Échec de l'installation des paquets.${N}"
+        log_action "unattended-upgrades : échec apt-get install"
+        pause; return
+    fi
     export PATH=$PATH:/usr/sbin
-    dpkg-reconfigure --priority=low unattended-upgrades
+    dpkg-reconfigure --priority=low unattended-upgrades \
+        || echo -e "${Y}⚠ dpkg-reconfigure a retourné une erreur — poursuite malgré tout.${N}"
     local conf="/etc/apt/apt.conf.d/50unattended-upgrades"
     [[ ! -f "$conf" ]] && { echo -e "${R}Fichier conf introuvable.${N}"; pause; return; }
     echo -e "\n${Y}Application configuration recommandée (communauté Jeedom)...${N}"
-    _unatd_set "$conf" '//Unattended-Upgrade::Automatic-Reboot "false";'               'Unattended-Upgrade::Automatic-Reboot "true";'
-    _unatd_set "$conf" '//Unattended-Upgrade::Automatic-Reboot-WithUsers "true";'     'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";'
-    _unatd_set "$conf" '//Unattended-Upgrade::Automatic-Reboot-Time "02:00";'         'Unattended-Upgrade::Automatic-Reboot-Time "05:00";'
-    _unatd_set "$conf" '//Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";'  'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";'
-    _unatd_set "$conf" '//Unattended-Upgrade::Remove-New-Unused-Dependencies "true";' 'Unattended-Upgrade::Remove-New-Unused-Dependencies "true";'
-    _unatd_set "$conf" '//Unattended-Upgrade::Remove-Unused-Dependencies "false";'    'Unattended-Upgrade::Remove-Unused-Dependencies "true";'
-    echo -e "\n${G}✔ Configuré — reboot à 5h UTC si patch kernel nécessaire.${N}"
-    log_action "unattended-upgrades configuré"
+    local failed=0
+    _unatd_set "$conf" '//Unattended-Upgrade::Automatic-Reboot "false";'               'Unattended-Upgrade::Automatic-Reboot "true";'               || failed=1
+    _unatd_set "$conf" '//Unattended-Upgrade::Automatic-Reboot-WithUsers "true";'     'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";'     || failed=1
+    _unatd_set "$conf" '//Unattended-Upgrade::Automatic-Reboot-Time "02:00";'         'Unattended-Upgrade::Automatic-Reboot-Time "05:00";'         || failed=1
+    _unatd_set "$conf" '//Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";'  'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";'  || failed=1
+    _unatd_set "$conf" '//Unattended-Upgrade::Remove-New-Unused-Dependencies "true";' 'Unattended-Upgrade::Remove-New-Unused-Dependencies "true";' || failed=1
+    _unatd_set "$conf" '//Unattended-Upgrade::Remove-Unused-Dependencies "false";'    'Unattended-Upgrade::Remove-Unused-Dependencies "true";'     || failed=1
+    if [[ $failed -eq 0 ]]; then
+        echo -e "\n${G}✔ Configuré — reboot à 5h UTC si patch kernel nécessaire.${N}"
+        log_action "unattended-upgrades configuré"
+    else
+        echo -e "\n${R}✘ Configuration incomplète — voir les échecs ci-dessus.${N}"
+        log_action "unattended-upgrades configuré avec erreurs"
+    fi
     pause
 }
 
@@ -1198,7 +1311,18 @@ menu_cleanup() {
 _rescue_log() {
     local msg="$1"
     local line; line="$(date '+%Y-%m-%d %H:%M:%S') [$(whoami)] ${msg}"
-    echo "${line}" >> "${LOG_DIR}/jeehelp_rescue.log" 2>/dev/null
+    local target="${LOG_DIR}/jeehelp_rescue.log"
+    # ${LOG_DIR} appartient à www-data (comme tout core Jeedom) : un process
+    # www-data compromis pourrait y remplacer ce fichier par un lien
+    # symbolique vers une cible root arbitraire. root suivrait ce lien à
+    # l'`>>` suivant et y ajouterait la ligne de log. -L teste le lien
+    # lui-même (pas sa cible), donc ce test détecte le cas même si la cible
+    # du lien n'existe pas encore.
+    if [[ -L "${target}" ]] || { [[ -e "${target}" ]] && [[ ! -f "${target}" ]]; }; then
+        log_action "RESCUE-LOG-ALERTE: ${target} n'est pas un fichier régulier (lien symbolique ?) — écriture refusée"
+    else
+        echo "${line}" >> "${target}" 2>/dev/null
+    fi
     log_action "RESCUE: ${msg}"
 }
 
@@ -1326,8 +1450,9 @@ cli_mode() {
         --check)
             echo "[CLI] Vérification système..."
             _H_OK=0; _H_WARN=0; _H_ERR=0
-            _watchdog_check
-            _ssl_check "$(hostname -f 2>/dev/null || hostname)" ;;
+            _watchdog_check; local wd_rc=$?
+            _ssl_check "$(hostname -f 2>/dev/null || hostname)"; local ssl_rc=$?
+            [[ ${wd_rc} -ne 0 || ${ssl_rc} -ne 0 ]] && rc=1 ;;
         --health)
             echo "[CLI] Health check complet..."
             show_health "cli"
@@ -1350,7 +1475,7 @@ cli_mode() {
             echo "Usage: sudo bash $0 [option]"
             echo "  --backup            Lancer une sauvegarde"
             echo "  --repair-db         Réparer la base de données"
-            echo "  --check             Vérification rapide"
+            echo "  --check             Vérification rapide (code retour : 0 OK, 1 anomalie)"
             echo "  --health            Health check complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
@@ -1400,4 +1525,13 @@ main_menu() {
 [[ -n "$1" ]] && cli_mode "$@"
 check_root
 check_jeedom
+# Le menu interactif lit le clavier en continu ; sans TTY (cron, stdin
+# redirigé/fermé) read_key renverrait "eof" en boucle. La protection dans
+# nav_menu suffit à ne plus boucler indéfiniment, mais autant refuser
+# clairement ce mode ici plutôt que d'ouvrir un menu inutilisable.
+if [[ ! -t 0 || ! -t 1 ]]; then
+    echo "Aucun terminal détecté : le menu interactif nécessite un TTY." >&2
+    echo "Utilisez une option CLI, par exemple : sudo bash $0 --health" >&2
+    exit 1
+fi
 main_menu
