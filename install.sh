@@ -54,4 +54,4 @@ bash -n "${source_file}" || { echo "Le script téléchargé contient une erreur 
 install -m 0755 -o root -g root "${source_file}" "${INSTALL_PATH}"
 
 echo "jeehelp installé : ${INSTALL_PATH}"
-echo "Utilisation : jeehelp (interactif) ou jeehelp --backup / --repair-db / --check / --upgrade-security"
+echo "Utilisation : sudo jeehelp (interactif) ou sudo jeehelp --backup / --repair-db / --check / --health / --fix-perms / --upgrade-security"
