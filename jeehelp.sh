@@ -1749,6 +1749,12 @@ generate_report() {
         file=""
         log_action "RAPPORT : écriture impossible dans ${LOG_DIR}"
     fi
+    if [[ "${mode}" == "silent" ]]; then
+        _R_FINAL="${_R_BODY}.final"
+        [[ ${nerr} -gt 0 ]] && return 2
+        [[ ${nwarn} -gt 0 ]] && return 1
+        return 0
+    fi
     if [[ "${mode}" == "cli" || ! -t 1 ]]; then
         cat "${_R_BODY}.final"
         [[ -n "${file}" ]] && echo "Rapport enregistré : ${file}"
@@ -1766,6 +1772,390 @@ menu_report() {
     header; section "Rapport de diagnostic"
     echo -e "  ${DIM}Collecte en cours (30 s environ)...${N}"
     generate_report interactive
+    pause
+}
+
+# ============================================================
+#  ANALYSE PAR IA  (jeehelp --ask / menu « Analyser avec l'IA »)
+# ============================================================
+#  Envoie le rapport de diagnostic à une IA et affiche son analyse.
+#  Canaux : (1) plugin ai_assistant via son CLI PHP (aucune clé API ni
+#  Apache requis, MariaDB + core suffisent) ; (2) appel direct d'une API
+#  compatible OpenAI configurée dans /etc/jeehelp/ai.conf (seul canal si
+#  Jeedom/MariaDB sont HS). Ordre : fournisseurs LOCAUX d'abord, puis cloud.
+#
+#  Garde-fous :
+#   - cloud : rapport ANONYMISÉ (IP, hôte, chemins, logs retirés) + accord
+#     explicite par fournisseur ; local : rapport complet, secrets masqués ;
+#   - l'IA ne fait que PROPOSER : le texte de sa réponse n'est JAMAIS exécuté.
+#     Seuls les identifiants du catalogue AI_ACTIONS sont reconnus, chacun
+#     exige une confirmation [o/N], et rien n'est proposé hors TTY ;
+#   - sortie de l'IA assainie (caractères de contrôle/ANSI supprimés).
+#
+#  /etc/jeehelp/ai.conf (root, 600) — clés :
+#    AI_ALLOWED_CLOUD="2386 direct"   fournisseurs cloud déjà autorisés
+#    AI_ORDER="2981 2386"             ordre de préférence des cloud (optionnel)
+#    AI_DIRECT_URL / AI_DIRECT_MODEL / AI_DIRECT_KEY   canal direct (optionnel)
+
+readonly AI_CONF="/etc/jeehelp/ai.conf"
+readonly AI_CLI="${JEEDOM_DIR}/plugins/ai_assistant/core/php/ai_assistant.cli.php"
+readonly _SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+declare -g _R_FINAL=""
+
+# id → "option CLI|risque|description". Seuls ces ids existent.
+declare -gA AI_ACTIONS=(
+    [check]="--check|lecture|Vérification rapide (cron, disque, SSL)"
+    [health]="--health|lecture|Contrôle de santé complet"
+    [report]="--report|lecture|Régénérer le rapport de diagnostic"
+    [fix-perms]="--fix-perms|modification|Rétablir les droits fichiers (comme le bouton Jeedom)"
+    [repair-db]="--repair-db|modification|REPAIR TABLE sur toutes les tables"
+    [backup]="--backup|modification|Lancer une sauvegarde Jeedom"
+)
+
+_ai_conf_get() {
+    [[ -r "${AI_CONF}" ]] || return 0
+    awk -F= -v k="$1" '$1==k{sub(/^[^=]*=/,""); gsub(/^"|"$/,""); print; exit}' "${AI_CONF}"
+}
+
+_ai_conf_add() {  # clé valeur : ajoute une valeur à une liste séparée par des espaces
+    local cur; cur=$(_ai_conf_get "$1")
+    [[ " ${cur} " == *" $2 "* ]] && return 0
+    ( umask 077
+      install -d -m 700 "$(dirname "${AI_CONF}")"
+      { grep -v "^$1=" "${AI_CONF}" 2>/dev/null; echo "$1=\"${cur:+${cur} }$2\""; } > "${AI_CONF}.tmp"
+      mv "${AI_CONF}.tmp" "${AI_CONF}"; chmod 600 "${AI_CONF}" )
+}
+
+_ai_url_scope() {  # URL → local|cloud
+    local h; h=$(sed -E 's#^[a-z]+://([^/:]+).*#\1#' <<< "$1")
+    [[ "${h}" =~ ^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) || "${h}" == *.local || "${h}" == *.lan ]] \
+        && echo local || echo cloud
+}
+
+# Masque les secrets ; en mode cloud anonymise aussi (IP, MAC, hôte, chemins)
+# et retire les blocs de logs/messages (lignes indentées de 10 espaces).
+# $1 entrée  $2 sortie  $3 fichier de correspondances  $4 local|cloud  $5 1 = garder les logs
+_ai_prepare() {
+    perl -e '
+use strict; use warnings;
+my ($in,$out,$map,$mode,$logs,$host)=@ARGV;
+my (%m,%n,@map);
+sub tok { my($k,$v)=@_; return $m{$k}{$v} //= do { my $t=$k."_".(++$n{$k}); push @map,"$t\t$v"; $t } }
+open my $fh,"<:encoding(UTF-8)",$in or die; my @lines=<$fh>; close $fh;
+my @o;
+for my $l (@lines) {
+  next if $mode eq "cloud" && !$logs && $l =~ /^ {10}\S/;
+  $l =~ s/\b(Bearer|Basic)\s+\S+/$1 [REDACTED]/g;
+  $l =~ s/(api[_-]?key|token|secret|passw(?:or)?d|authorization)(\s*[=:]\s*)\S+/$1$2\[REDACTED]/ig;
+  $l =~ s/\bsk-[A-Za-z0-9_-]{16,}/[REDACTED]/g;
+  $l =~ s/\b[A-Za-z0-9+=_-]{40,}\b/[REDACTED]/g;
+  if ($mode eq "cloud") {
+    $l =~ s/\b((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})\b/tok("MAC",$1)/ge;
+    $l =~ s/\b((?:\d{1,3}\.){3}\d{1,3})\b/tok("IP",$1)/ge;
+    $l =~ s/(?<![0-9A-Za-z:])((?=[0-9a-fA-F:]*[a-fA-F])[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){2,7})(?![0-9A-Za-z:])/tok("IP6",$1)/ge;
+    $l =~ s/\Q$host\E/HOST/g if length $host;
+    $l =~ s{/var/www/html}{<JEEDOM>}g;
+  }
+  push @o,$l;
+}
+open my $oh,">:encoding(UTF-8)",$out or die; print $oh @o; close $oh;
+open my $mh,">:encoding(UTF-8)",$map or die; print $mh map {"$_\n"} @map;
+print $mh "HOST\t$host\n<JEEDOM>\t/var/www/html\n"; close $mh;
+' "$1" "$2" "$3" "$4" "$5" "$(hostname)"
+}
+
+# Remet les valeurs d'origine dans le texte de l'IA (jetons IP_1, HOST, <JEEDOM>...)
+_ai_deanon() {  # fichier de correspondances ; filtre stdin → stdout
+    perl -e '
+use strict; use warnings; binmode(STDIN,":encoding(UTF-8)"); binmode(STDOUT,":encoding(UTF-8)");
+my %m; open my $f,"<:encoding(UTF-8)",$ARGV[0] or exit; while(<$f>){chomp; my($k,$v)=split /\t/,$_,2; $m{$k}=$v if defined $v}
+while(<STDIN>){ s/(<JEEDOM>|\b(?:IP6?|MAC)_\d+\b|\bHOST\b)/exists $m{$1} ? $m{$1} : $1/ge; print }
+' "$1"
+}
+
+# Rapport trop gros : on ne garde que l'en-tête, la synthèse et les lignes WARN/ERR
+_ai_trim() {  # fichier
+    local max="${JEEHELP_AI_MAXBYTES:-20000}"
+    [[ $(wc -c < "$1") -le ${max} ]] && return 0
+    awk '/^── /{sec=1; print; next} !sec{print; next} /^\[(WARN|ERR)\]/{print}' "$1" > "$1.trim" && mv "$1.trim" "$1"
+    echo "[Rapport réduit : seules les lignes WARN/ERR de chaque section sont conservées]" >> "$1"
+}
+
+_ai_system_prompt() {  # fichier de sortie
+    {
+        cat <<'TXT'
+Rôle : expert Jeedom 4.6 / Debian 13 / MariaDB. Tu analyses un rapport de diagnostic généré par l'outil jeehelp.
+Le rapport peut être anonymisé : IP_n, MAC_n, HOST et <JEEDOM> sont des jetons, pas de vraies valeurs.
+
+Règles strictes :
+- Tu ne demandes ni ne produis jamais de secret (mot de passe, clé API, token).
+- Tu n'exécutes rien : tu proposes seulement. N'écris aucun appel d'outil, aucun bloc de commandes shell, aucune commande Jeedom.
+- Appuie chaque hypothèse sur des lignes précises du rapport. N'invente rien : si l'information manque, dis-le.
+- Classe la situation : critique (Jeedom inutilisable ou données en danger), majeur, mineur, info.
+
+Sois très concis (la réponse est limitée en taille) : diagnostic en 3 phrases maximum, 4 causes maximum, 2 preuves courtes par cause (120 caractères max), pas de markdown.
+Réponds UNIQUEMENT par un objet JSON (sans texte autour, sans bloc de code) :
+{"gravite":"critique|majeur|mineur|info",
+ "diagnostic":"résumé en 2-4 phrases, en français",
+ "causes":[{"hypothese":"...","preuves":["ligne ou valeur du rapport"],"confiance":"haute|moyenne|faible"}],
+ "actions":[{"id":"<id du catalogue>","raison":"pourquoi"}],
+ "demande_section":null}
+"actions" ne peut contenir QUE des id du catalogue ci-dessous ; tout autre id sera ignoré. "demande_section" : texte libre si une information supplémentaire est nécessaire, sinon null.
+
+Catalogue des actions (id : effet) :
+TXT
+        local id spec
+        for id in "${!AI_ACTIONS[@]}"; do
+            spec="${AI_ACTIONS[$id]}"
+            echo "- ${id} : ${spec#*|*|} [risque : $(cut -d'|' -f2 <<< "${spec}")]"
+        done | sort
+    } > "$1"
+}
+
+_AI_RENDER_PHP='
+$t = trim((string)file_get_contents(getenv("AI_IN")));
+$t = preg_replace("/^```(?:json)?\s*|\s*```$/m", "", $t);
+$a = strpos($t, "{"); $b = strrpos($t, "}");
+if ($a === false || $b === false) exit(3);
+$j = json_decode(substr($t, $a, $b - $a + 1), true);
+if (!is_array($j) || !isset($j["gravite"], $j["diagnostic"])) exit(3);
+$c = function ($s) { $s = is_scalar($s) ? (string)$s : json_encode($s, JSON_UNESCAPED_UNICODE);
+    return preg_replace("/[\x00-\x08\x0B-\x1F\x7F]/", "", $s); };
+$g = strtolower($c($j["gravite"]));
+if (!in_array($g, ["critique", "majeur", "mineur", "info"], true)) $g = "inconnue";
+$o = "GRAVITE=" . $g . "\nDiagnostic : " . $c($j["diagnostic"]) . "\n";
+if (!empty($j["causes"]) && is_array($j["causes"])) {
+    $o .= "\nCauses probables :\n"; $i = 0;
+    foreach ($j["causes"] as $cs) { if (!is_array($cs)) continue; $i++;
+        $o .= "  " . $i . ". " . $c($cs["hypothese"] ?? "?") . " (confiance : " . $c($cs["confiance"] ?? "?") . ")\n";
+        foreach ((array)($cs["preuves"] ?? []) as $p) $o .= "       - " . $c($p) . "\n"; }
+}
+if (!empty($j["demande_section"])) $o .= "\nInformation demandée par l IA : " . $c($j["demande_section"]) . "\n";
+file_put_contents(getenv("AI_OUT"), $o);
+$acts = "";
+foreach ((array)($j["actions"] ?? []) as $x) { if (!is_array($x)) continue;
+    $acts .= str_replace(["\t", "\n"], " ", $c($x["id"] ?? "")) . "\t" . str_replace(["\t", "\n"], " ", $c($x["raison"] ?? "")) . "\n"; }
+file_put_contents(getenv("AI_ACT"), $acts);
+'
+
+_ai_render() {  # réponse_brute texte_sorti actions_sortie
+    AI_IN="$1" AI_OUT="$2" AI_ACT="$3" php -r "${_AI_RENDER_PHP}"
+}
+
+# Appel direct d'une API compatible OpenAI (chat/completions)
+_ai_direct_call() {  # wd msgfile sysfile resp → ligne OK|...|ERR|... ; rc 0/1
+    local wd="$1" url key model code
+    url=$(_ai_conf_get AI_DIRECT_URL); key=$(_ai_conf_get AI_DIRECT_KEY); model=$(_ai_conf_get AI_DIRECT_MODEL)
+    [[ -n "${url}" && -n "${model}" ]] || { echo "ERR|direct|AI_DIRECT_URL/AI_DIRECT_MODEL manquants"; return 1; }
+    [[ -z "${key}" || "${key}" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || { echo "ERR|direct|AI_DIRECT_KEY invalide"; return 1; }
+    AI_MSG="$2" AI_SYS="$3" AI_MODEL="${model}" php -r 'echo json_encode(["model"=>getenv("AI_MODEL"),"temperature"=>0.2,"messages"=>[["role"=>"system","content"=>file_get_contents(getenv("AI_SYS"))],["role"=>"user","content"=>file_get_contents(getenv("AI_MSG"))]]], JSON_UNESCAPED_UNICODE);' > "${wd}/req.json"
+    ( umask 077; { echo 'header = "Content-Type: application/json"'; [[ -n "${key}" ]] && echo "header = \"Authorization: Bearer ${key}\""; } > "${wd}/curl.cfg" )
+    code=$(curl -sS --max-time 240 -K "${wd}/curl.cfg" -d "@${wd}/req.json" -o "${wd}/out.json" -w '%{http_code}' "${url}" 2>"${wd}/curl.err")
+    if [[ "${code}" != 200 ]]; then echo "ERR|direct|HTTP ${code:-000} $(head -c 120 "${wd}/curl.err" | tr '\n|' '  ')"; return 1; fi
+    AI_OUTJ="${wd}/out.json" AI_RESP="$4" php -r '$j=json_decode(file_get_contents(getenv("AI_OUTJ")),true); $t=trim((string)($j["choices"][0]["message"]["content"] ?? "")); if($t===""){exit(1);} file_put_contents(getenv("AI_RESP"),$t);' \
+        || { echo "ERR|direct|réponse vide ou illisible"; return 1; }
+    echo "OK|direct|$(_ai_url_scope "${url}")|${model}|-"
+}
+
+ask_ai() {
+    local wd; wd=$(mktemp -d)
+    chown www-data:www-data "${wd}"; chmod 700 "${wd}"
+    _ask_ai_run "${wd}" "$@"; local rc=$?
+    rm -rf "${wd}"
+    return ${rc}
+}
+
+_ask_ai_run() {
+    local wd="$1"; shift
+    local tty=0 pick=0 with_logs=0 dry=0 only="" rfile="" chan="auto"
+    [[ -t 0 && -t 1 ]] && tty=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pick) pick=1 ;;
+            --with-logs) with_logs=1 ;;
+            --dry-run) dry=1 ;;
+            --provider) only="${2:-}"; shift ;;
+            --file) rfile="${2:-}"; shift ;;
+            --channel) chan="${2:-auto}"; shift ;;
+            *) echo "Option inconnue : $1 (--pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run)" >&2; return 2 ;;
+        esac
+        shift
+    done
+
+    # ── 1. Rapport ──
+    local rep="${wd}/rapport.txt"
+    if [[ -n "${rfile}" ]]; then
+        [[ -r "${rfile}" ]] || { echo "Fichier illisible : ${rfile}" >&2; return 2; }
+        cp "${rfile}" "${rep}"
+    else
+        echo -e "${DIM}Collecte du rapport de diagnostic...${N}"
+        generate_report silent >/dev/null 2>&1
+        [[ -n "${_R_FINAL}" && -f "${_R_FINAL}" ]] || { echo "Impossible de générer le rapport." >&2; return 2; }
+        mv "${_R_FINAL}" "${rep}"; _R_FINAL=""
+    fi
+    local full="${wd}/full.txt" cloud="${wd}/cloud.txt" map="${wd}/map.tsv" map_l="${wd}/map_local.tsv"
+    _ai_prepare "${rep}" "${full}" "${map_l}" local 1
+    _ai_prepare "${rep}" "${cloud}" "${map}" cloud "${with_logs}"
+    _ai_trim "${full}"; _ai_trim "${cloud}"
+    if [[ ${dry} -eq 1 ]]; then
+        echo "── Charge utile qui serait envoyée à un fournisseur CLOUD ($(wc -c < "${cloud}") octets) ──"
+        cat "${cloud}"; return 0
+    fi
+    local sysf="${wd}/system.txt"; _ai_system_prompt "${sysf}"
+    chown www-data:www-data "${full}" "${cloud}" "${sysf}"; chmod 640 "${full}" "${cloud}" "${sysf}"
+
+    # ── 2. Candidats : "canal|id|nom|provider|modèle|scope" ──
+    local -a cands=() locals=() clouds=()
+    local line id name prov model scope state
+    if [[ "${chan}" != direct && -f "${AI_CLI}" ]]; then
+        while IFS='|' read -r id name prov model scope state; do
+            [[ "${state}" == ok && -n "${id}" ]] || continue
+            [[ -n "${only}" && "${only}" != "${id}" ]] && continue
+            if [[ "${scope}" == local ]]; then locals+=("plugin|${id}|${name}|${prov}|${model}|local")
+            else clouds+=("plugin|${id}|${name}|${prov}|${model}|cloud"); fi
+        done < <(sudo -u www-data php "${AI_CLI}" list 2>/dev/null)
+        # cloud : ordre de préférence AI_ORDER d'abord
+        local ordered=() o c
+        for o in $(_ai_conf_get AI_ORDER); do
+            for c in "${clouds[@]}"; do [[ "${c}" == plugin\|"${o}"\|* ]] && ordered+=("${c}"); done
+        done
+        for c in "${clouds[@]}"; do [[ " ${ordered[*]} " == *"${c}"* ]] || ordered+=("${c}"); done
+        clouds=("${ordered[@]}")
+    fi
+    if [[ "${chan}" != plugin && -z "${only}" ]]; then
+        local durl dmodel; durl=$(_ai_conf_get AI_DIRECT_URL); dmodel=$(_ai_conf_get AI_DIRECT_MODEL)
+        if [[ -n "${durl}" && -n "${dmodel}" ]]; then
+            if [[ "$(_ai_url_scope "${durl}")" == local ]]; then locals+=("direct|direct|API directe|direct|${dmodel}|local")
+            else clouds+=("direct|direct|API directe|direct|${dmodel}|cloud"); fi
+        fi
+    fi
+    cands=("${locals[@]}" "${clouds[@]}")
+    if [[ ${#cands[@]} -eq 0 ]]; then
+        echo -e "${R}Aucun fournisseur utilisable.${N} Plugin ai_assistant absent/KO et aucune API directe configurée (${AI_CONF})." >&2
+        return 1
+    fi
+
+    # ── 3. Choix manuel (liste) si demandé ──
+    if [[ ${pick} -eq 1 ]]; then
+        [[ ${tty} -eq 1 ]] || { echo "--pick nécessite un terminal." >&2; return 2; }
+        local -a labels=("⚙️   Automatique (local d'abord, puis les suivants)")
+        local cand
+        for cand in "${cands[@]}"; do
+            IFS='|' read -r _ id name prov model scope <<< "${cand}"
+            labels+=("$([[ ${scope} == local ]] && echo '🏠' || echo '☁️ ')  ${name}  (${prov}/${model}, ${scope})")
+        done
+        labels+=("↩  Annuler")
+        nav_menu "Fournisseur IA" "${labels[@]}"
+        [[ ${MENU_RESULT} -eq -1 || ${MENU_RESULT} -eq $(( ${#labels[@]} - 1 )) ]] && return 0
+        [[ ${MENU_RESULT} -gt 0 ]] && cands=("${cands[$(( MENU_RESULT - 1 ))]}")
+    fi
+
+    # ── 4. Essais successifs ──
+    local allowed; allowed=" $(_ai_conf_get AI_ALLOWED_CLOUD) "
+    local resp="${wd}/reponse.txt" txt="${wd}/analyse.txt" acts="${wd}/actions.tsv" raw_kept=""
+    local cand ch msgf mapf status prc ok=0 used="" skipped=0
+    for cand in "${cands[@]}"; do
+        IFS='|' read -r ch id name prov model scope <<< "${cand}"
+        if [[ "${scope}" == cloud ]]; then
+            if [[ "${allowed}" != *" ${id} "* ]]; then
+                if [[ ${tty} -eq 1 ]]; then
+                    confirm "Envoyer le rapport ANONYMISÉ ($(wc -c < "${cloud}") octets) à ${name} (${prov}/${model}, cloud)" || { echo -e "  ${Y}– ${name} : refusé.${N}"; continue; }
+                    confirm "Mémoriser ce fournisseur comme autorisé" && { _ai_conf_add AI_ALLOWED_CLOUD "${id}"; allowed+="${id} "; }
+                else
+                    skipped=$((skipped+1)); continue
+                fi
+            fi
+            msgf="${cloud}"; mapf="${map}"
+        else
+            msgf="${full}"; mapf="${map_l}"
+        fi
+        echo -e "${DIM}→ ${name} (${prov}/${model}, ${scope})...${N}"
+        rm -f "${resp}"; touch "${resp}"; chown www-data:www-data "${resp}"; chmod 660 "${resp}"
+        if [[ "${ch}" == plugin ]]; then
+            status=$(timeout 240 sudo -u www-data php "${AI_CLI}" ask --id "${id}" --message-file "${msgf}" --system-file "${sysf}" --out "${resp}" 2>/dev/null | tail -1)
+            prc=${PIPESTATUS[0]}
+            [[ ${prc} -eq 124 ]] && status="ERR|${id}|timeout (240 s)"
+        else
+            status=$(_ai_direct_call "${wd}" "${msgf}" "${sysf}" "${resp}"); prc=$?
+        fi
+        if [[ "${status}" != OK\|* ]]; then
+            echo -e "  ${R}✘${N} échec : ${status#ERR|*|}"
+            [[ ${prc} -eq 124 && "${scope}" == cloud ]] && echo -e "  ${Y}⚠ après un timeout, le fournisseur a peut-être déjà reçu le rapport.${N}"
+            log_action "ASK ${name} (${scope}) ÉCHEC"
+            continue
+        fi
+        if AI_IN="${resp}" AI_OUT="${txt}" AI_ACT="${acts}" php -r "${_AI_RENDER_PHP}"; then
+            ok=1; used="${name} (${prov}/${model}, ${scope})"; log_action "ASK ${name} (${scope}) OK"
+            _ai_deanon "${mapf}" < "${txt}" > "${txt}.d" && mv "${txt}.d" "${txt}"
+            break
+        fi
+        echo -e "  ${Y}⚠${N} réponse non structurée (JSON attendu), essai suivant"
+        raw_kept="${wd}/raw_$(date +%s).txt"; cp "${resp}" "${raw_kept}"
+        log_action "ASK ${name} (${scope}) réponse non structurée"
+    done
+
+    [[ ${skipped} -gt 0 ]] && echo -e "${DIM}  ${skipped} fournisseur(s) cloud ignoré(s) : non autorisés (accord interactif, ou AI_ALLOWED_CLOUD dans ${AI_CONF}).${N}"
+    if [[ ${ok} -ne 1 ]]; then
+        echo -e "\n${R}✘ Aucune analyse exploitable.${N}"
+        if [[ -n "${raw_kept}" ]]; then
+            echo -e "${Y}Dernière réponse brute (non structurée, aucune action proposée) :${N}\n"
+            tr -d '\000-\010\013-\037\177' < "${raw_kept}" | head -c 4000; echo
+        fi
+        return 1
+    fi
+
+    # ── 5. Affichage ──
+    local grav; grav=$(sed -n 's/^GRAVITE=//p' "${txt}"); sed -i '/^GRAVITE=/d' "${txt}"
+    local gc="${W}"; case "${grav}" in critique) gc="${R}" ;; majeur) gc="${Y}" ;; mineur) gc="${C}" ;; info) gc="${G}" ;; esac
+    echo -e "\n${B}══ Analyse IA — ${used} ══${N}"
+    echo -e "Gravité : ${gc}${grav}${N}"
+    cat "${txt}"
+
+    # ── 6. Actions : propositions seulement, confirmation obligatoire ──
+    local aid reason spec flag risk desc n=0 shown=0
+    local out="${txt}"
+    if [[ -s "${acts}" ]]; then
+        echo -e "\n${W}Actions proposées :${N}"
+        # Fichier lu sur le descripteur 3 : confirm() lit le CLAVIER (stdin). Avec `done < fichier`,
+        # la confirmation consommerait des caractères du texte de l'IA (auto-confirmation possible).
+        while IFS=$'\t' read -r -u 3 aid reason; do
+            n=$((n+1))
+            if [[ -z "${AI_ACTIONS[${aid}]:-}" ]]; then
+                echo -e "  ${DIM}${n}. « ${aid:0:40} » : hors catalogue, ignorée${N}"; continue
+            fi
+            spec="${AI_ACTIONS[${aid}]}"; flag="${spec%%|*}"; risk=$(cut -d'|' -f2 <<< "${spec}"); desc="${spec#*|*|}"
+            echo -e "  ${n}. ${W}${aid}${N} — ${desc} ${DIM}[${risk}]${N}"
+            echo -e "     raison de l'IA : $(_ai_deanon "${mapf}" <<< "${reason:0:200}")"
+            echo "     commande : jeehelp ${flag}" >> /dev/null
+            if [[ ${tty} -eq 1 ]]; then
+                if confirm "     Exécuter « jeehelp ${flag} » (${risk})"; then
+                    echo; bash "${_SELF}" "${flag}"; local arc=$?
+                    echo -e "     ${DIM}→ code retour ${arc}${N}"; log_action "ASK action ${aid} confirmée, rc=${arc}"
+                else
+                    echo -e "     ${DIM}non exécutée${N}"
+                fi
+            fi
+            shown=$((shown+1))
+        done 3< "${acts}"
+        [[ ${tty} -eq 0 && ${shown} -gt 0 ]] && echo -e "  ${DIM}(hors terminal : propositions seulement, rien n'est exécuté)${N}"
+    fi
+
+    # ── 7. Conservation de l'analyse (sans le rapport) ──
+    local f="${LOG_DIR}/jeehelp_analyse_$(date +%Y%m%d-%H%M%S).txt"
+    if ( set -C; { echo "Analyse IA — ${used} — $(date '+%F %T')"; echo "Gravité : ${grav}"; cat "${txt}"; } > "${f}" ) 2>/dev/null; then
+        chown www-data:www-data "${f}" 2>/dev/null; chmod 640 "${f}"
+        ls -t "${LOG_DIR}"/jeehelp_analyse_*.txt 2>/dev/null | tail -n +11 | xargs -r rm -f
+        echo -e "\n${DIM}Analyse enregistrée : ${f}${N}"
+    fi
+    [[ "${grav}" == critique ]] && return 2
+    [[ "${grav}" == majeur ]] && return 1
+    return 0
+}
+
+menu_ask() {
+    header; section "Analyser le rapport avec l'IA"
+    echo -e "  ${DIM}Local d'abord, puis les fournisseurs suivants. Cloud : rapport anonymisé + accord par fournisseur.${N}\n"
+    ask_ai --pick
     pause
 }
 
@@ -1799,6 +2189,10 @@ cli_mode() {
         --report)
             generate_report cli
             rc=$? ;;
+        --ask)
+            shift
+            ask_ai "$@"
+            rc=$? ;;
         --fix-perms)
             echo "[CLI] Rétablissement des droits..."
             fix_permissions "cli"
@@ -1820,6 +2214,7 @@ cli_mode() {
             echo "  --check             Vérification rapide (code retour : 0 OK, 1 anomalie)"
             echo "  --health            Health check complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --report            Rapport de diagnostic complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
+            echo "  --ask [options]     Analyse du rapport par IA (local d'abord) : --pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
             exit 1 ;;
@@ -1843,6 +2238,7 @@ main_menu() {
         "🔄  Mises à jour & sécurité"
         "🧹  Nettoyage"
         "📝  Générer un rapport de diagnostic"
+        "🤖  Analyser le rapport avec l'IA"
         "🆘  Mode secours (interface web injoignable)"
         "❌  Quitter"
     )
@@ -1850,7 +2246,7 @@ main_menu() {
     while true; do
         nav_menu "Menu principal" "${opts[@]}"
         case $MENU_RESULT in
-            -1|11) _exit_clean ;;
+            -1|12) _exit_clean ;;
             0) show_system_info ;;
             1) menu_health      ;;
             2) menu_backups     ;;
@@ -1861,7 +2257,8 @@ main_menu() {
             7) menu_updates     ;;
             8) menu_cleanup     ;;
             9) menu_report      ;;
-            10) menu_rescue     ;;
+            10) menu_ask        ;;
+            11) menu_rescue     ;;
         esac
     done
 }
