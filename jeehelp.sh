@@ -254,9 +254,17 @@ mysql_cmd() {
     mysql --defaults-extra-file="${DB_OPTFILE}" "${DB_NAME}" "$@" 2>/dev/null
 }
 
+# `systemctl list-units` ne liste que les unités déjà chargées (typiquement
+# actives) : un service installé mais jamais démarré depuis le boot n'y
+# apparaît pas et serait déclaré "absent" à tort. `list-unit-files` liste
+# toutes les unités présentes sur le disque, quel que soit leur état.
+_svc_exists() {
+    systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${1}\.service"
+}
+
 svc_ctl() {
     local action="$1" svc="$2"
-    systemctl list-units --type=service 2>/dev/null | grep -q "^  ${svc}" \
+    _svc_exists "${svc}" \
         || { echo -e "${Y}Service ${svc} absent.${N}"; return 1; }
     systemctl "${action}" "${svc}" \
         && echo -e "${G}✔ ${svc} ${action} OK${N}" \
@@ -322,7 +330,7 @@ show_system_info() {
     printf "  ${W}%-16s${N} %s\n" "Disque"    "$(df -h "${JEEDOM_DIR}" | awk 'NR==2{print $3"/"$2" ("$5")"}')"
     section "Services"
     for svc in apache2 nginx mysql mariadb; do
-        systemctl list-units --type=service 2>/dev/null | grep -q "^  ${svc}" || continue
+        _svc_exists "${svc}" || continue
         local st; st=$(systemctl is-active "${svc}" 2>/dev/null)
         [[ "${st}" == "active" ]] \
             && echo -e "  ${G}●${N} ${svc}" \
@@ -349,7 +357,9 @@ _ssl_check() {
     local domain="${1:-$(hostname -f)}"
     command -v openssl &>/dev/null || { echo -e "  ${Y}openssl non disponible${N}"; return; }
     local expiry
-    expiry=$(echo | openssl s_client -connect "${domain}:443" \
+    # timeout explicite : un pare-feu qui droppe sans répondre bloquerait
+    # sinon s_client indéfiniment (pas de timeout par défaut côté openssl).
+    expiry=$(echo | timeout 10 openssl s_client -connect "${domain}:443" \
              -servername "${domain}" 2>/dev/null \
              | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
     if [[ -z "$expiry" ]]; then
@@ -404,14 +414,14 @@ show_health() {
 
     # ── Services web ──
     for svc in apache2 nginx; do
-        systemctl list-units --type=service 2>/dev/null | grep -q "^  ${svc}" || continue
+        _svc_exists "${svc}" || continue
         local st; st=$(systemctl is-active "$svc" 2>/dev/null)
         [[ "$st" == "active" ]] && _chk "$svc" ok "actif" || _chk "$svc" err "$st"
     done
 
     # ── Services DB ──
     for svc in mysql mariadb; do
-        systemctl list-units --type=service 2>/dev/null | grep -q "^  ${svc}" || continue
+        _svc_exists "${svc}" || continue
         local st; st=$(systemctl is-active "$svc" 2>/dev/null)
         [[ "$st" == "active" ]] && _chk "$svc" ok "actif" || _chk "$svc" err "$st"
     done
@@ -480,7 +490,7 @@ show_health() {
     local domain; domain=$(hostname -f 2>/dev/null || hostname)
     command -v openssl &>/dev/null && {
         local expiry
-        expiry=$(echo | openssl s_client -connect "${domain}:443" \
+        expiry=$(echo | timeout 10 openssl s_client -connect "${domain}:443" \
                  -servername "${domain}" 2>/dev/null \
                  | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
         if [[ -z "$expiry" ]]; then
@@ -854,7 +864,7 @@ menu_services() {
 _svc_status() {
     header; section "État des services"
     for svc in apache2 nginx mysql mariadb php8.2-fpm php8.3-fpm; do
-        systemctl list-units --type=service 2>/dev/null | grep -q "^  ${svc}" || continue
+        _svc_exists "${svc}" || continue
         local st; st=$(systemctl is-active "${svc}" 2>/dev/null)
         [[ "${st}" == "active" ]] \
             && echo -e "  ${G}● ACTIF ${N} ${svc}" \
