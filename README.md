@@ -154,6 +154,7 @@ Archives Jeedom (`*.tar.gz`) et dumps SQL (`dump_*.sql.gz`) sont proposés, du p
 
 ```bash
 sudo jeehelp --backup            # Lancer une sauvegarde Jeedom
+sudo jeehelp --self-update       # Mettre jeehelp à jour depuis GitHub (aperçu + confirmation ; --yes sans question, --branch alpha)
 sudo jeehelp --download [N]      # Lister les sauvegardes, ou envoyer la N-ième sur stdout (voir SSH ci-dessus)
 sudo jeehelp --repair-db         # REPAIR TABLE sur toutes les tables
 sudo jeehelp --check             # Vérification rapide (watchdog + SSL)
@@ -169,8 +170,16 @@ cron quotidien, ou `jeehelp --backup` avant une mise à jour manuelle).
 
 ## Mise à jour
 
-Relancer la commande d'installation : elle télécharge la dernière version de `jeehelp.sh`
-depuis la branche `beta` et remplace `/usr/local/bin/jeehelp`.
+```bash
+sudo jeehelp --self-update
+```
+
+Télécharge la dernière version depuis la branche `beta`, vérifie la syntaxe, affiche un aperçu
+(empreintes, lignes modifiées, dernier commit) et demande confirmation avant de remplacer
+`/usr/local/bin/jeehelp`. L'ancienne version est gardée dans `/usr/local/bin/jeehelp.prev`
+(retour arrière : `sudo cp /usr/local/bin/jeehelp.prev /usr/local/bin/jeehelp`).
+Options : `--yes` (sans confirmation, pour un script) et `--branch alpha` (version de test).
+Relancer la commande d'installation reste possible et donne le même résultat.
 
 ## Analyse par IA : configuration
 

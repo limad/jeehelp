@@ -2404,6 +2404,59 @@ menu_ask() {
 #  MODE CLI NON-INTERACTIF
 # ============================================================
 
+# jeehelp --self-update [--branch NOM] [--yes] : met à jour /usr/local/bin/jeehelp depuis GitHub.
+# Le code est exécuté en root : téléchargement HTTPS depuis le dépôt fixe, contrôle de syntaxe,
+# aperçu (empreintes, lignes modifiées, dernier commit) et confirmation avant remplacement.
+# L'ancienne version est conservée dans /usr/local/bin/jeehelp.prev (retour arrière possible).
+readonly SELF_PATH="/usr/local/bin/jeehelp"
+readonly SELF_REPO="limad/jeehelp"
+
+self_update() {
+    local branch="beta" yes=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --branch) branch="${2:-}"; shift 2 || true ;;
+            --yes|-y) yes=1; shift ;;
+            *) echo "Option inconnue : $1 (--branch NOM, --yes)" >&2; return 2 ;;
+        esac
+    done
+    if [[ ! "${branch}" =~ ^[A-Za-z0-9._-]{1,40}$ ]]; then echo "Nom de branche invalide." >&2; return 2; fi
+    local dl; command -v curl &>/dev/null && dl=curl || { command -v wget &>/dev/null && dl=wget; }
+    [[ -n "${dl:-}" ]] || { echo "Ni curl ni wget n'est disponible." >&2; return 1; }
+
+    local tmp; tmp=$(mktemp -d) || return 1
+    _TMP_CLEAN+=("${tmp}")
+    local url="https://raw.githubusercontent.com/${SELF_REPO}/${branch}/jeehelp.sh?t=$(date +%s)"
+    echo "Téléchargement de jeehelp.sh (branche ${branch})..."
+    if [[ "${dl}" == curl ]]; then curl -fsSL --max-time 30 "${url}" -o "${tmp}/new"
+    else wget -qO "${tmp}/new" --timeout=30 "${url}"; fi || { echo -e "${R}Échec du téléchargement.${N}" >&2; return 1; }
+
+    if ! bash -n "${tmp}/new" 2>/dev/null || ! head -1 "${tmp}/new" | grep -q '^#!/bin/bash' \
+       || ! grep -q '^cli_mode()' "${tmp}/new" || [[ $(wc -c < "${tmp}/new") -lt 20000 ]]; then
+        echo -e "${R}Le fichier téléchargé n'est pas un jeehelp valide, abandon.${N}" >&2; return 1
+    fi
+
+    local cur_h new_h
+    cur_h=$(sha256sum "${SELF_PATH}" 2>/dev/null | cut -c1-12); new_h=$(sha256sum "${tmp}/new" | cut -c1-12)
+    if [[ "${cur_h}" == "${new_h}" ]]; then echo -e "${G}✔${N} Déjà à jour (${new_h})."; return 0; fi
+
+    echo "  Installée : ${cur_h:-aucune}   Disponible : ${new_h}"
+    [[ -f "${SELF_PATH}" ]] && echo "  Lignes : $(diff "${SELF_PATH}" "${tmp}/new" | grep -c '^>') ajoutée(s)/modifiée(s), $(diff "${SELF_PATH}" "${tmp}/new" | grep -c '^<') retirée(s)/remplacée(s)"
+    local msg
+    msg=$(curl -fsSL --max-time 5 "https://api.github.com/repos/${SELF_REPO}/commits/${branch}" 2>/dev/null \
+          | php -r '$j=json_decode(stream_get_contents(STDIN),true); echo substr(strtok((string)($j["commit"]["message"]??""),"\n"),0,120);' 2>/dev/null)
+    [[ -n "${msg}" ]] && echo "  Dernier commit : ${msg}"
+
+    if [[ ${yes} -ne 1 ]]; then
+        confirm "Installer cette version dans ${SELF_PATH}" || { echo "Annulé."; return 1; }
+    fi
+    [[ -f "${SELF_PATH}" ]] && install -m 0644 -o root -g root "${SELF_PATH}" "${SELF_PATH}.prev"
+    install -m 0755 -o root -g root "${tmp}/new" "${SELF_PATH}.new" && mv -f "${SELF_PATH}.new" "${SELF_PATH}" \
+        || { echo -e "${R}Installation impossible.${N}" >&2; return 1; }
+    log_action "CLI --self-update branche ${branch} : ${cur_h:-aucune} -> ${new_h}"
+    echo -e "${G}✔${N} jeehelp mis à jour (${new_h}). Retour arrière : sudo cp ${SELF_PATH}.prev ${SELF_PATH}"
+}
+
 # Sauvegardes téléchargeables : archives Jeedom et dumps SQL, de la plus récente (1) à la plus ancienne.
 _dl_list() {
     find "${BACKUP_DIR}" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name 'dump_*.sql.gz' \) \
@@ -2445,7 +2498,11 @@ cli_mode() {
     check_root; check_jeedom
     local rc=0
     [[ "$1" == download ]] && set -- --download "${@:2}"
+    [[ "$1" == update || "$1" == self-update ]] && set -- --self-update "${@:2}"
     case "$1" in
+        --self-update)
+            shift; self_update "$@"
+            rc=$? ;;
         --download)
             cli_download "${2:-}"
             rc=$? ;;
@@ -2498,6 +2555,7 @@ cli_mode() {
             echo "  --report            Rapport de diagnostic complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --ask [options]     Analyse du rapport par IA (local d'abord) : --pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run --include-invalid"
             echo "  --download [N]               Liste les sauvegardes, ou envoie la N-ième (1 = dernière) sur stdout : ssh box "sudo jeehelp --download 1" > f.tar.gz"
+            echo "  --self-update       Mettre jeehelp à jour depuis GitHub (--branch NOM, --yes)"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
             exit 1 ;;
