@@ -126,6 +126,7 @@ Menu principal
 │   ├── 🧩 Désactiver tous les plugins
 │   ├── ⏱️ Désactiver le système cron
 │   └── ⏱️ Activer le système cron
+├── ⬆️ Mettre à jour jeehelp (GitHub)
 └── ❌ Quitter
 ```
 
