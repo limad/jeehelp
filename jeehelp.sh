@@ -2454,7 +2454,14 @@ self_update() {
     install -m 0755 -o root -g root "${tmp}/new" "${SELF_PATH}.new" && mv -f "${SELF_PATH}.new" "${SELF_PATH}" \
         || { echo -e "${R}Installation impossible.${N}" >&2; return 1; }
     log_action "CLI --self-update branche ${branch} : ${cur_h:-aucune} -> ${new_h}"
-    echo -e "${G}✔${N} jeehelp mis à jour (${new_h}). Retour arrière : sudo cp ${SELF_PATH}.prev ${SELF_PATH}"
+    echo -e "${G}✔${N} jeehelp mis à jour (${new_h}). Relancez jeehelp pour utiliser la nouvelle version."
+    echo "  Retour arrière : sudo cp ${SELF_PATH}.prev ${SELF_PATH}"
+}
+
+menu_self_update() {
+    header; section "Mise à jour de jeehelp"
+    self_update
+    pause
 }
 
 # Sauvegardes téléchargeables : archives Jeedom et dumps SQL, de la plus récente (1) à la plus ancienne.
@@ -2581,13 +2588,14 @@ main_menu() {
         "📝  Générer un rapport de diagnostic"
         "🤖  Analyser le rapport avec l'IA"
         "🆘  Mode secours (interface web injoignable)"
+        "⬆️   Mettre à jour jeehelp (GitHub)"
         "❌  Quitter"
     )
 
     while true; do
         nav_menu "Menu principal" "${opts[@]}"
         case $MENU_RESULT in
-            -1|12) _exit_clean ;;
+            -1|13) _exit_clean ;;
             0) show_system_info ;;
             1) menu_health      ;;
             2) menu_backups     ;;
@@ -2600,6 +2608,7 @@ main_menu() {
             9) menu_report      ;;
             10) menu_ask        ;;
             11) menu_rescue     ;;
+            12) menu_self_update ;;
         esac
     done
 }
