@@ -2514,7 +2514,8 @@ check_jeedom
 # clairement ce mode ici plutôt que d'ouvrir un menu inutilisable.
 if [[ ! -t 0 || ! -t 1 ]]; then
     echo "Aucun terminal détecté : le menu interactif nécessite un TTY." >&2
-    echo "Utilisez une option CLI, par exemple : sudo bash $0 --health" >&2
+    echo "Via SSH, demandez un terminal : ssh -t utilisateur@box \"sudo jeehelp\"" >&2
+    echo "Ou utilisez une option CLI, par exemple : sudo jeehelp --health" >&2
     exit 1
 fi
 main_menu

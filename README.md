@@ -131,6 +131,16 @@ Menu principal
 
 Chaque sous-menu se termine par « ↩ Retour » (ou la touche ÉCHAP). Les entrées sans sous-menu (informations système, rapport) s'exécutent directement.
 
+### Depuis un autre poste (SSH)
+
+Le menu a besoin d'un terminal : ajoutez `-t` à la commande SSH (sans lui : « Aucun terminal détecté »).
+
+```bash
+ssh -t utilisateur@box "sudo jeehelp"
+```
+
+Les options CLI ci-dessous fonctionnent sans `-t` : `ssh utilisateur@box "sudo jeehelp --check"`.
+
 ### Mode CLI (non-interactif)
 
 ```bash
