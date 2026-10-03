@@ -2404,10 +2404,51 @@ menu_ask() {
 #  MODE CLI NON-INTERACTIF
 # ============================================================
 
+# Sauvegardes téléchargeables : archives Jeedom et dumps SQL, de la plus récente (1) à la plus ancienne.
+_dl_list() {
+    find "${BACKUP_DIR}" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name 'dump_*.sql.gz' \) \
+        -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
+}
+
+# jeehelp --download [N] : sans N, liste numérotée ; avec N, envoie le fichier brut sur stdout
+# (ssh host "sudo jeehelp --download 1" > sauvegarde.tar.gz). Tout message va sur stderr.
+cli_download() {
+    _cursor_show() { :; }; _cursor_hide() { :; }   # tput écrirait sur stdout et corromprait le flux
+    local n="${1:-}" files=() f i
+    mapfile -t files < <(_dl_list)
+    if [[ ${#files[@]} -eq 0 ]]; then echo "Aucune sauvegarde dans ${BACKUP_DIR}." >&2; return 1; fi
+    if [[ -z "${n}" ]]; then
+        echo "Sauvegardes disponibles (1 = la plus récente) :" >&2
+        for i in "${!files[@]}"; do
+            printf '  %d  %s  %s  %s\n' "$((i+1))" "$(date -r "${files[$i]}" '+%Y-%m-%d %H:%M')" \
+                "$(du -h "${files[$i]}" | cut -f1)" "$(basename "${files[$i]}")" >&2
+        done
+        echo "Téléchargement : ssh utilisateur@box \"sudo jeehelp --download N\" > fichier  (sans -t)" >&2
+        return 0
+    fi
+    if [[ ! "${n}" =~ ^[1-9][0-9]{0,3}$ || "${n}" -gt ${#files[@]} ]]; then
+        echo "Numéro invalide : ${n} (1 à ${#files[@]}). Liste : jeehelp --download" >&2
+        return 1
+    fi
+    if [[ -t 1 ]]; then
+        echo "Refus : la sortie est un terminal (binaire). Redirigez vers un fichier :" >&2
+        echo "  ssh utilisateur@box \"sudo jeehelp --download ${n}\" > sauvegarde.tar.gz   (sans -t)" >&2
+        return 1
+    fi
+    f="${files[$((n-1))]}"
+    echo "Envoi de $(basename "${f}") ($(du -h "${f}" | cut -f1), sha256 $(sha256sum "${f}" | cut -d' ' -f1))" >&2
+    log_action "CLI --download ${n} : $(basename "${f}")"
+    cat -- "${f}"
+}
+
 cli_mode() {
     check_root; check_jeedom
     local rc=0
+    [[ "$1" == download ]] && set -- --download "${@:2}"
     case "$1" in
+        --download)
+            cli_download "${2:-}"
+            rc=$? ;;
         --backup)
             echo "[CLI] Sauvegarde..."
             _jee_php 'jeedom::backup(false);'
@@ -2456,6 +2497,7 @@ cli_mode() {
             echo "  --health            Health check complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --report            Rapport de diagnostic complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --ask [options]     Analyse du rapport par IA (local d'abord) : --pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run --include-invalid"
+            echo "  --download [N]               Liste les sauvegardes, ou envoie la N-ième (1 = dernière) sur stdout : ssh box "sudo jeehelp --download 1" > f.tar.gz"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
             exit 1 ;;
