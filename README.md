@@ -141,10 +141,20 @@ ssh -t utilisateur@box "sudo jeehelp"
 
 Les options CLI ci-dessous fonctionnent sans `-t` : `ssh utilisateur@box "sudo jeehelp --check"`.
 
+**Télécharger une sauvegarde** sur votre poste (sans `-t`, le flux est binaire) :
+
+```bash
+ssh utilisateur@box "sudo jeehelp --download"                              # liste numérotée (1 = la plus récente)
+ssh utilisateur@box "sudo jeehelp --download 1" > sauvegarde.tar.gz        # télécharge la n°1
+```
+
+Archives Jeedom (`*.tar.gz`) et dumps SQL (`dump_*.sql.gz`) sont proposés, du plus récent au plus ancien. Le nom, la taille et le sha256 sont affichés sur stderr pour vérifier l'intégrité ; le script refuse d'écrire du binaire sur un terminal. Chaque téléchargement est journalisé. Une sauvegarde contient des secrets : stockez-la en lieu sûr.
+
 ### Mode CLI (non-interactif)
 
 ```bash
 sudo jeehelp --backup            # Lancer une sauvegarde Jeedom
+sudo jeehelp --download [N]      # Lister les sauvegardes, ou envoyer la N-ième sur stdout (voir SSH ci-dessus)
 sudo jeehelp --repair-db         # REPAIR TABLE sur toutes les tables
 sudo jeehelp --check             # Vérification rapide (watchdog + SSL)
 sudo jeehelp --health            # Health check complet (équivalent au menu "Santé")
