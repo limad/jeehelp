@@ -475,6 +475,20 @@ _chk() {
     esac
 }
 
+# Identité matérielle : device-tree (ARM/SBC — Smart/Atlas) sinon DMI (x86-64).
+# Les box officielles Atlas sont confirmées Rock Pi 4B (Radxa) ; Smart n'a pas
+# de nom de carte public confirmé, donc seul Atlas est reconnu par le motif
+# ci-dessous — Smart reste affichée en clair (non classée "officielle") plutôt
+# que de deviner une chaîne non vérifiée.
+_hw_model() {
+    if [[ -r /proc/device-tree/model ]]; then
+        tr -d '\0' < /proc/device-tree/model
+    elif [[ -r /sys/class/dmi/id/product_name ]]; then
+        { cat /sys/class/dmi/id/sys_vendor 2>/dev/null; cat /sys/class/dmi/id/product_name 2>/dev/null; } \
+            | tr '\n' ' ' | sed 's/^ *//;s/ *$//'
+    fi
+}
+
 # Compte les fichiers proches du datadir par défaut qui n'appartiennent pas
 # à mysql. Ce contrôle borné reste léger et ne suit pas les autres systèmes
 # de fichiers montés sous le répertoire.
@@ -489,6 +503,16 @@ show_health() {
     [[ "$mode" == "interactive" ]] && header
     section "Vérification générale"
     _H_OK=0; _H_WARN=0; _H_ERR=0
+
+    # ── Matériel ──
+    local hw_model; hw_model=$(_hw_model)
+    if [[ -z "${hw_model}" ]]; then
+        _chk "Matériel" ok "indéterminé"
+    elif [[ "${hw_model}" =~ [Rr]ock[[:space:]]?[Pp]i|[Rr]adxa ]]; then
+        _chk "Matériel" warn "${hw_model} — box officielle Jeedom (Atlas) : après une mise à jour noyau, MAC/IP peuvent changer"
+    else
+        _chk "Matériel" ok "${hw_model}"
+    fi
 
     # ── PHP ──
     local php_ver; php_ver=$(php -r 'echo PHP_VERSION;' 2>/dev/null)
@@ -640,6 +664,18 @@ show_health() {
         && _chk "http.error" warn "${err_count} lignes" \
         || _chk "http.error" ok   "${err_count} lignes"
 
+    # ── Signal spécifique : boucle de login après restauration causée par des
+    # droits incorrects. PHP ne peut plus écrire ses logs (fwrite() sur un
+    # stream invalide) → erreur fatale sur chaque page, y compris la page
+    # rescue. Cas réel confirmé par l'équipe Jeedom, résolu par chown/chmod
+    # (cf. « Rétablissement des droits »).
+    if [[ -f "${LOG_DIR}/http.error" ]] \
+        && grep -q 'fwrite(): Argument #1 (\$stream) must be of type resource' "${LOG_DIR}/http.error" 2>/dev/null; then
+        _chk "Droits (log PHP)" err "erreur fatale d'écriture détectée (fwrite/stream) : lancez « Rétablissement des droits »"
+    else
+        _chk "Droits (log PHP)" ok "aucune erreur fatale d'écriture détectée"
+    fi
+
     # ── SSL ──
     command -v openssl &>/dev/null && {
         local ssl_host ssl_exp ssl_days ssl_found=0 ssl_tested=()
@@ -742,19 +778,100 @@ fix_permissions() {
     return $failed
 }
 
+# ── Maintenance générale ─────────────────────────────────────
+# Enchaîne les 3 remèdes les plus demandés en support après un incident
+# (restauration, migration, blocage) : droits, DB, cache. Une seule
+# confirmation globale ; chaque étape reste journalisée individuellement.
+maintenance_generale() {
+    header; section "Maintenance générale"
+    load_mysql_creds
+    echo -e "  Enchaîne, sans confirmation intermédiaire :"
+    echo -e "  • Rétablissement des droits (chown www-data + chmod 775/665)"
+    echo -e "  • Vérification + réparation de toute la base ${DB_NAME} (CHECK/REPAIR TABLE)"
+    echo -e "  • Vidage du cache Jeedom"
+    echo
+    confirm "Lancer la maintenance générale (3 étapes)" || { echo -e "${Y}Annulé.${N}"; pause; return 1; }
+    echo
+
+    local failed=0
+
+    echo -e "  ${W}① Droits${N}"
+    if fix_permissions cli; then
+        echo -e "    ${G}✔${N} Droits rétablis"
+    else
+        echo -e "    ${R}✘${N} Échec (voir ${AUDIT_LOG})"
+        failed=1
+    fi
+    echo
+
+    echo -e "  ${W}② Base de données${N}"
+    if _db_check_and_repair cli; then
+        log_action "Maintenance générale: DB check/repair OK"
+    else
+        log_action "Maintenance générale: DB check/repair ÉCHEC ou anomalie"
+        failed=1
+    fi
+    echo
+
+    echo -e "  ${W}③ Cache${N}"
+    if _jee_php 'cache::flush();' >/dev/null 2>&1; then
+        echo -e "    ${G}✔${N} Cache vidé"
+        log_action "Maintenance générale: cache vidé"
+    else
+        echo -e "    ${R}✘${N} Erreur vidage cache"
+        log_action "Maintenance générale: cache ÉCHEC"
+        failed=1
+    fi
+
+    echo
+    if [[ $failed -eq 0 ]]; then
+        echo -e "  ${G}✔ Maintenance générale terminée avec succès.${N}"
+        log_action "Maintenance générale: succès"
+    else
+        echo -e "  ${R}✘ Maintenance générale terminée avec au moins une erreur — voir ${AUDIT_LOG}${N}"
+        log_action "Maintenance générale: terminée avec erreurs"
+    fi
+    pause
+    return $failed
+}
+
+# Liste les utilisateurs Jeedom (login). Équivalent de `jeecli.php user list`
+# mais appelé directement via le core PHP (_jee_php, déjà le mécanisme utilisé
+# partout ailleurs dans jeehelp) plutôt qu'en invoquant ce script externe :
+# jeehelp reste indépendant des autres fichiers/scripts du core.
+_show_users() {
+    header; section "Utilisateurs Jeedom"
+    # _jee_php fusionne stderr dans sa sortie (erreurs PHP incluses) : il faut
+    # vérifier son code retour avant d'afficher le texte, sinon une erreur
+    # fatale PHP (core.inc.php cassé, etc.) s'affiche comme si c'était la
+    # liste des utilisateurs.
+    local out; out=$(_jee_php 'foreach (user::all() as $u) { echo $u->getLogin() . "\n"; }')
+    local rc=$?
+    if [[ ${rc} -ne 0 ]]; then
+        echo -e "${R}✘ Core PHP Jeedom inaccessible :${N}\n${out}"
+    elif [[ -n "${out}" ]]; then
+        echo "${out}"
+    else
+        echo -e "${R}✘ Aucun utilisateur trouvé.${N}"
+    fi
+    pause
+}
+
 # Sous-menu santé
 menu_health() {
     local opts=(
         "🔍  Vérification générale (health check)"
         "🔑  Rétablissement des droits fichiers/dossiers"
+        "👤  Lister les utilisateurs"
         "↩  Retour"
     )
     while true; do
         nav_menu "Santé & Droits" "${opts[@]}"
         case $MENU_RESULT in
-            -1|2) return ;;
+            -1|3) return ;;
             0) show_health      ;;
             1) fix_permissions  ;;
+            2) _show_users      ;;
         esac
     done
 }
@@ -959,6 +1076,63 @@ _db_all_tables() {
     return $failed
 }
 
+# Équivalent SQL de `mysqlcheck --auto-repair --check` : CHECK TABLE sur
+# chaque table, puis REPAIR TABLE seulement sur celles signalées anormales.
+# Le binaire client `mysqlcheck` a disparu du paquet mariadb-client sur
+# Debian 13 (testé absent sur cette box) ; on repasse donc par mysql_cmd,
+# déjà utilisé partout ailleurs dans le script.
+_db_check_and_repair() {
+    local mode="${1:-interactive}"
+    [[ "$mode" == "interactive" ]] && { header; section "Vérification + réparation (CHECK/REPAIR TABLE)"; }
+
+    local raw_tables; raw_tables=$(mysql_cmd -N -e "SHOW TABLES;")
+    if [[ $? -ne 0 ]]; then
+        echo -e "${R}✘ Impossible d'énumérer les tables (SHOW TABLES a échoué).${N}"
+        log_action "DB check/repair : échec SHOW TABLES"
+        [[ "$mode" == "interactive" ]] && pause
+        return 1
+    fi
+
+    local -a tables=()
+    [[ -n "${raw_tables}" ]] && mapfile -t tables <<< "${raw_tables}"
+    if [[ ${#tables[@]} -eq 0 ]]; then
+        echo -e "${R}✘ Aucune table trouvée : base vide ou schéma inaccessible, aucune opération lancée.${N}"
+        log_action "DB check/repair : aucune table trouvée"
+        [[ "$mode" == "interactive" ]] && pause
+        return 1
+    fi
+
+    local failed=0 tbl tbl_escaped check_out last_msg repair_out rstatus
+    for tbl in "${tables[@]}"; do
+        tbl_escaped="${tbl//\`/\`\`}"
+        check_out=$(mysql_cmd -N -e "CHECK TABLE \`${tbl_escaped}\`;")
+        last_msg=$(awk -F'\t' '{print $4}' <<< "${check_out}" | tail -1)
+        # Seul Msg_type="error" est une vraie anomalie. Un "note" (ex: moteur
+        # MEMORY — "doesn't support check") est normal et ne doit PAS déclencher
+        # de REPAIR : sur une table MEMORY, REPAIR TABLE la vide (elle n'a pas
+        # de fichier à réparer), ce qui serait une perte de données inutile à
+        # chaque exécution.
+        if awk -F'\t' '$3=="error"{f=1} END{exit !f}' <<< "${check_out}"; then
+            repair_out=$(mysql_cmd -N -e "REPAIR TABLE \`${tbl_escaped}\`;")
+            rstatus=$(awk -F'\t' '{print $4}' <<< "${repair_out}" | tail -1)
+            printf "  %-35s %s → REPAIR : %s\n" "${tbl}" "${last_msg}" "${rstatus:-pas de réponse}"
+            [[ "${rstatus}" != "OK" ]] && failed=1
+        else
+            printf "  %-35s %s\n" "${tbl}" "${last_msg:-OK}"
+        fi
+    done
+
+    if [[ $failed -eq 0 ]]; then
+        echo -e "\n${G}✔ Terminé.${N}"
+        log_action "DB check/repair"
+    else
+        echo -e "\n${Y}⚠ Terminé avec au moins une table en anomalie après réparation.${N}"
+        log_action "DB check/repair (anomalies détectées)"
+    fi
+    [[ "$mode" == "interactive" ]] && pause
+    return $failed
+}
+
 _db_sizes() {
     header; section "Taille des tables"
     load_mysql_creds
@@ -972,17 +1146,8 @@ _db_sizes() {
 }
 
 _db_mysqlcheck() {
-    header; section "mysqlcheck --auto-repair"
     load_mysql_creds
-    if mysqlcheck --defaults-extra-file="${DB_OPTFILE}" \
-               --auto-repair --check "${DB_NAME}" 2>/dev/null; then
-        echo -e "\n${G}✔ Terminé.${N}"
-        log_action "DB mysqlcheck"
-    else
-        echo -e "\n${R}✘ Erreur lors de mysqlcheck.${N}"
-        log_action "DB mysqlcheck ÉCHEC"
-    fi
-    pause
+    _db_check_and_repair interactive
 }
 
 _db_dump() {
@@ -2578,6 +2743,7 @@ main_menu() {
     local opts=(
         "📊  Informations système & watchdog"
         "🏥  Santé générale & droits fichiers"
+        "🧰  Maintenance générale (droits + DB + cache)"
         "💾  Sauvegardes"
         "🗄️   Base de données"
         "⚙️   Services & Jeedom"
@@ -2595,20 +2761,21 @@ main_menu() {
     while true; do
         nav_menu "Menu principal" "${opts[@]}"
         case $MENU_RESULT in
-            -1|13) _exit_clean ;;
+            -1|14) _exit_clean ;;
             0) show_system_info ;;
             1) menu_health      ;;
-            2) menu_backups     ;;
-            3) menu_database    ;;
-            4) menu_services    ;;
-            5) menu_logs        ;;
-            6) menu_network     ;;
-            7) menu_updates     ;;
-            8) menu_cleanup     ;;
-            9) menu_report      ;;
-            10) menu_ask        ;;
-            11) menu_rescue     ;;
-            12) menu_self_update ;;
+            2) maintenance_generale ;;
+            3) menu_backups     ;;
+            4) menu_database    ;;
+            5) menu_services    ;;
+            6) menu_logs        ;;
+            7) menu_network     ;;
+            8) menu_updates     ;;
+            9) menu_cleanup     ;;
+            10) menu_report     ;;
+            11) menu_ask        ;;
+            12) menu_rescue     ;;
+            13) menu_self_update ;;
         esac
     done
 }
