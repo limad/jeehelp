@@ -10,6 +10,14 @@ Navigation interactive : ↑↓ sélection, ENTRÉE valider, ÉCHAP retour, CTRL
 Chaque action sensible (restauration, suppression, reboot, mise à jour...) demande une
 confirmation, et les actions sont journalisées dans `/var/log/jeedom-menu.log`.
 
+### Aperçu des écrans
+
+![Informations système](docs/informations-systeme.png)
+
+![Rétablissement des droits Jeedom](docs/retablissement-droits.png)
+
+![Menu Sauvegardes](docs/menu-sauvegardes.png)
+
 ## Installation
 
 Sur la box Jeedom, en une commande (avec `curl`, présent par défaut sur Jeedom) :
