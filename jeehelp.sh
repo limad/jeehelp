@@ -1252,7 +1252,7 @@ menu_updates() {
         "⬆️   Mettre à jour Jeedom (core)"
         "📦  apt update + upgrade"
         "🔒  Configurer unattended-upgrades"
-        "🧪  Dry-run unattended-upgrades"
+        "🧪  Simuler les mises à jour de sécurité (sans rien appliquer)"
         "📊  Statut unattended-upgrades"
         "🛡️   Appliquer les mises à jour de sécurité maintenant"
         "↩  Retour"
@@ -1365,7 +1365,7 @@ _unattended_setup() {
 }
 
 _unattended_dryrun() {
-    header; section "Dry-run unattended-upgrades"
+    header; section "Simulation des mises à jour de sécurité (sans rien appliquer)"
     command -v unattended-upgrade &>/dev/null \
         && unattended-upgrade --dry-run -v 2>&1 | tail -30 \
         || echo -e "${R}unattended-upgrades non installé.${N}"
