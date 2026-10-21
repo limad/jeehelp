@@ -1214,10 +1214,17 @@ menu_network() {
             0) header; section "Interfaces réseau"
                ip -4 addr show; echo; ip route | grep default; pause ;;
             1) header; section "Test connectivité"
+               # Certains hôtes (ex. jeedom.com) bloquent l'ICMP en production :
+               # un ping KO ne veut pas dire hôte injoignable. On confirme par
+               # une requête HTTPS avant de déclarer un hôte en échec.
                for h in 8.8.8.8 1.1.1.1 google.com jeedom.com; do
-                   ping -c1 -W2 "${h}" &>/dev/null \
-                       && echo -e "  ${G}✔${N} ${h}" \
-                       || echo -e "  ${R}✘${N} ${h}"
+                   if ping -c1 -W2 "${h}" &>/dev/null; then
+                       echo -e "  ${G}✔${N} ${h}"
+                   elif curl -s -o /dev/null --max-time 3 "https://${h}" 2>/dev/null; then
+                       echo -e "  ${G}✔${N} ${h} ${DIM}(ping bloqué, HTTPS OK)${N}"
+                   else
+                       echo -e "  ${R}✘${N} ${h}"
+                   fi
                done; pause ;;
             2) header; section "Ports en écoute"
                ss -tlnp 2>/dev/null; pause ;;
