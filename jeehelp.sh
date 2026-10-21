@@ -665,6 +665,16 @@ show_health() {
         && _chk "Paquets système" warn "${apt_upgradable} mise(s) à jour disponible(s)" \
         || _chk "Paquets système" ok   "${apt_upgradable} mise(s) à jour disponible(s)"
 
+    # Mises à jour de sécurité Debian : seuil distinct et bas, car une seule
+    # mise à jour de sécurité en attente est plus significative que le volume
+    # global de paquets (ci-dessus, seuil à 20).
+    local apt_security=0
+    apt_security=$(apt list --upgradable 2>/dev/null | grep -c security || echo 0)
+    if   [[ $apt_security -ge 5 ]]; then _chk "Mises à jour sécurité" err  "${apt_security} paquet(s) debian-security en attente"
+    elif [[ $apt_security -ge 1 ]]; then _chk "Mises à jour sécurité" warn "${apt_security} paquet(s) debian-security en attente"
+    else                                  _chk "Mises à jour sécurité" ok   "aucune"
+    fi
+
     # ── Résumé ──
     echo
     echo -e "  ${B}────────────────────────────────────────────${N}"
@@ -2024,6 +2034,7 @@ declare -gA AI_ACTIONS=(
     [fix-perms]="--fix-perms|modification|Rétablir les droits fichiers (comme le bouton Jeedom)"
     [repair-db]="--repair-db|modification|REPAIR TABLE sur toutes les tables"
     [backup]="--backup|modification|Lancer une sauvegarde Jeedom"
+    [upgrade-security]="--upgrade-security|modification|Appliquer les mises à jour de sécurité Debian"
 )
 
 _ai_conf_get() {
@@ -2545,13 +2556,24 @@ cli_mode() {
             rc=$? ;;
         --upgrade-security)
             echo "[CLI] unattended-upgrade..."
+            apt-get update -qq
             if command -v unattended-upgrade &>/dev/null; then
                 unattended-upgrade -v 2>&1
                 rc=$?
                 log_action "CLI --upgrade-security (rc=${rc})"
             else
-                echo "unattended-upgrades non installé."
-                rc=1
+                echo "unattended-upgrades non installé — repli sur apt-get upgrade (paquets debian-security uniquement)."
+                local sec_pkgs
+                sec_pkgs=$(apt list --upgradable 2>/dev/null | grep security | cut -d/ -f1)
+                if [[ -z "${sec_pkgs}" ]]; then
+                    echo "Aucun paquet debian-security en attente."
+                    rc=0
+                else
+                    # shellcheck disable=SC2086
+                    apt-get upgrade --only-upgrade -y ${sec_pkgs} 2>&1
+                    rc=$?
+                fi
+                log_action "CLI --upgrade-security (repli apt-get upgrade --only-upgrade, rc=${rc})"
             fi ;;
         *)
             echo "Usage: sudo bash $0 [option]"
