@@ -1254,12 +1254,13 @@ menu_updates() {
         "🔒  Configurer unattended-upgrades"
         "🧪  Dry-run unattended-upgrades"
         "📊  Statut unattended-upgrades"
+        "🛡️   Appliquer les mises à jour de sécurité maintenant"
         "↩  Retour"
     )
     while true; do
         nav_menu "Mises à jour & Sécurité" "${opts[@]}"
         case $MENU_RESULT in
-            -1|6) return ;;
+            -1|7) return ;;
             0) header; section "Vérification des mises à jour"
                # update::checkAllUpdate() + refreshUpdateMessage() = action
                # exacte de l'ajax core update.ajax.php?action=checkAllUpdate.
@@ -1296,6 +1297,7 @@ menu_updates() {
             3) _unattended_setup  ;;
             4) _unattended_dryrun ;;
             5) _unattended_status ;;
+            6) _upgrade_security interactive ;;
         esac
     done
 }
@@ -1379,6 +1381,40 @@ _unattended_status() {
         && { echo -e "${W}Dernier log :${N}"; tail -15 "$latest"; } \
         || echo -e "${Y}Aucun log trouvé.${N}"
     pause
+}
+
+#  Déclenche les mises à jour de sécurité Debian immédiatement (le service
+#  unattended-upgrades les applique déjà tout seul en tâche de fond une fois
+#  configuré ; cette fonction sert au déclenchement manuel, interactif ou CLI).
+#  Repli sur apt-get upgrade --only-upgrade (paquets *-security) si
+#  unattended-upgrades n'est pas installé.
+_upgrade_security() {
+    local mode="${1:-interactive}" rc=0
+    [[ "$mode" == "interactive" ]] && { header; section "Mises à jour de sécurité Debian"
+        confirm "Appliquer les mises à jour de sécurité maintenant" || { echo -e "${Y}Annulé.${N}"; pause; return 1; }
+        echo
+    }
+    apt-get update -qq
+    if command -v unattended-upgrade &>/dev/null; then
+        unattended-upgrade -v 2>&1
+        rc=$?
+        log_action "upgrade-security (${mode}, rc=${rc})"
+    else
+        echo "unattended-upgrades non installé — repli sur apt-get upgrade (paquets debian-security uniquement)."
+        local sec_pkgs
+        sec_pkgs=$(apt list --upgradable 2>/dev/null | grep security | cut -d/ -f1)
+        if [[ -z "${sec_pkgs}" ]]; then
+            echo "Aucun paquet debian-security en attente."
+            rc=0
+        else
+            # shellcheck disable=SC2086
+            apt-get upgrade --only-upgrade -y ${sec_pkgs} 2>&1
+            rc=$?
+        fi
+        log_action "upgrade-security (${mode}, repli apt-get upgrade --only-upgrade, rc=${rc})"
+    fi
+    [[ "$mode" == "interactive" ]] && pause
+    return $rc
 }
 
 # ============================================================
@@ -2563,25 +2599,8 @@ cli_mode() {
             rc=$? ;;
         --upgrade-security)
             echo "[CLI] unattended-upgrade..."
-            apt-get update -qq
-            if command -v unattended-upgrade &>/dev/null; then
-                unattended-upgrade -v 2>&1
-                rc=$?
-                log_action "CLI --upgrade-security (rc=${rc})"
-            else
-                echo "unattended-upgrades non installé — repli sur apt-get upgrade (paquets debian-security uniquement)."
-                local sec_pkgs
-                sec_pkgs=$(apt list --upgradable 2>/dev/null | grep security | cut -d/ -f1)
-                if [[ -z "${sec_pkgs}" ]]; then
-                    echo "Aucun paquet debian-security en attente."
-                    rc=0
-                else
-                    # shellcheck disable=SC2086
-                    apt-get upgrade --only-upgrade -y ${sec_pkgs} 2>&1
-                    rc=$?
-                fi
-                log_action "CLI --upgrade-security (repli apt-get upgrade --only-upgrade, rc=${rc})"
-            fi ;;
+            _upgrade_security cli
+            rc=$? ;;
         *)
             echo "Usage: sudo bash $0 [option]"
             echo "  --backup            Lancer une sauvegarde"
