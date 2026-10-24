@@ -124,7 +124,14 @@ read_key() {
                 *)    KEY_RESULT="esc"   ;;
             esac
             ;;
-        $'\n'|$'\r'|'')  KEY_RESULT="enter"  ;;
+        $'\r')
+            # Certains terminaux envoient \r\n pour une seule touche Entrée :
+            # avaler le \n résiduel pour qu'il ne soit pas lu comme réponse
+            # au prochain read -rsn1 (ex. confirm() derrière un item de menu).
+            KEY_RESULT="enter"
+            read -rsn1 -t 0.05 _ 2>/dev/null
+            ;;
+        $'\n'|'')  KEY_RESULT="enter"  ;;
         $'\x03')          KEY_RESULT="ctrlc"  ;;
         $'\x04')          KEY_RESULT="ctrld"  ;;
         *)                KEY_RESULT="$key"   ;;
