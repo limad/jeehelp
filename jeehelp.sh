@@ -7,7 +7,7 @@
 #  CLI        : sudo jeehelp --backup | --repair-db | --check | --health | --disk
 #                            --report | --ask [options] | --download [N]
 #                            --self-update [--branch NOM] [--yes] | --fix-perms
-#                            --upgrade-security | --restart-check
+#                            --upgrade-security | --restart-check | --uninstall [--yes]
 #  Internes   : --apt-hook MODE, --apt-hook-run MODE (appelés par le hook apt)
 # ============================================================
 
@@ -1998,6 +1998,13 @@ _stale_restart_unit() {
     if ! grep -qxF "service|${u}" <<< "${cur}"; then
         printf '  %b %s\n' "${DIM}–${N}" "${u} : déjà à jour"; return 0
     fi
+    if [[ "${u}" =~ ${_STALE_AUTO_SAFE} ]]; then
+        local busy; busy=$(_unit_foreign_procs "${u}" '^(apache2|httpd|nginx|php-fpm.*|php[0-9.]*-fpm|rotatelogs|htcacheclean)$')
+        if [[ -n "${busy}" ]]; then
+            printf '  %b %s\n' "${Y}⚠${N}" "${u} : tâche lancée depuis Jeedom en cours (${busy}), non relancé : réessayer plus tard"
+            return 1
+        fi
+    fi
     if systemctl restart -- "${u}" 2>&1; then
         printf '  %b %s\n' "${G}✔${N}" "${u}"; log_action "relance ${u} (bibliothèques mises à jour)"
     else
@@ -2054,8 +2061,28 @@ _apt_hook() {
 
 #  Vérification lancée par le timer, une fois apt/dpkg terminés (30 min max).
 #  Remplace le message Jeedom précédent ; l'efface s'il n'y a plus rien.
+#  Processus d'une unité qui ne sont pas le service lui-même (motif $2 sur
+#  comm) : tâches lancées depuis l'interface Jeedom (installation de
+#  dépendances, mise à jour du core...) qui vivent dans le cgroup d'Apache ou
+#  de PHP-FPM et seraient tuées par sa relance. Affiche « comm(pid) ... ».
+_unit_foreign_procs() {
+    local unit="$1" allow="$2" cg f pid comm out=""
+    cg=$(systemctl show -p ControlGroup --value "${unit}" 2>/dev/null)
+    [[ -n "${cg}" ]] || return 0
+    for f in "/sys/fs/cgroup${cg}/cgroup.procs" "/sys/fs/cgroup/systemd${cg}/cgroup.procs"; do
+        [[ -r "${f}" ]] || continue
+        while read -r pid; do
+            comm=$(head -c 32 "/proc/${pid}/comm" 2>/dev/null | tr -d '\n' | tr -c '[:alnum:]._@:+-' '?')
+            [[ -z "${comm}" || "${comm}" =~ ${allow} ]] && continue
+            out+="${comm}(${pid}) "
+        done < "${f}"
+        break
+    done
+    printf '%s' "${out% }"
+}
+
 _apt_hook_run() {
-    local mode="$1" i kind name out summary msg
+    local mode="$1" i kind name out summary msg busy
     local -a restarted=() failed=()
     for ((i = 0; i < 180; i++)); do _dpkg_busy || break; sleep 10; done
     if [[ "${mode}" == auto ]] && _dpkg_busy; then
@@ -2074,6 +2101,12 @@ _apt_hook_run() {
                 if [[ "${name}" == nginx.service ]] && ! nginx -t >/dev/null 2>&1; then
                     failed+=("${name} (nginx -t en échec)"); continue
                 fi
+                # Une tâche lancée depuis l'interface tourne dans ce cgroup :
+                # la relance la tuerait. On signale, l'admin relancera plus tard.
+                busy=$(_unit_foreign_procs "${name}" '^(apache2|httpd|nginx|php-fpm.*|php[0-9.]*-fpm|rotatelogs|htcacheclean)$')
+                if [[ -n "${busy}" ]]; then
+                    failed+=("${name} (tâche en cours, non relancé : ${busy})"); continue
+                fi
                 if systemctl restart -- "${name}" >/dev/null 2>&1; then restarted+=("${name}"); else failed+=("${name}"); fi
             elif [[ "${kind}" == plugin ]]; then
                 if out=$(_stale_restart_plugin "${name}"); then restarted+=("${name}"); else failed+=("${name} (${out})"); fi
@@ -2090,6 +2123,7 @@ _apt_hook_run() {
     fi
     log_action "apt-hook (${mode}) : à relancer : ${summary}"
     msg="Après une mise à jour, des processus utilisent encore d'anciennes bibliothèques : le correctif ne les protège qu'après relance. ${summary}. Pour les relancer : sudo jeehelp, menu Mises à jour, Processus à relancer."
+    [[ ${#failed[@]}    -gt 0 ]] && msg="Non relancés : ${failed[*]}. ${msg}"
     [[ ${#restarted[@]} -gt 0 ]] && msg="Relancés automatiquement : ${restarted[*]}. ${msg}"
     _jee_php_env "JH_MSG=${msg}" 'message::add("jeehelp", getenv("JH_MSG"), "", "restart-check");' >/dev/null
     return 1
@@ -2119,7 +2153,8 @@ _apt_hook_setup() {
     header; section "Vérification automatique après mise à jour"
     if [[ -z "${mode}" ]]; then
         rm -f "${APT_HOOK_FILE}"
-        echo -e "${G}✔ Désactivée${N} (${APT_HOOK_FILE} supprimé)."
+        _jee_php 'message::removeAll("jeehelp", "restart-check");' >/dev/null
+        echo -e "${G}✔ Désactivée${N} (${APT_HOOK_FILE} supprimé, message Jeedom effacé)."
         log_action "hook apt désactivé"
         pause; return
     fi
@@ -3733,6 +3768,33 @@ menu_ask() {
 #  MODE CLI NON-INTERACTIF
 # ============================================================
 
+# jeehelp --uninstall [--yes] : retire tout ce que jeehelp a posé sur la box.
+# Conservés : le journal d'audit /var/log/jeedom-menu.log et les rapports
+# dans log/ de Jeedom (traces), ainsi que les sauvegardes Jeedom.
+jeehelp_uninstall() {
+    local yes=0 f
+    [[ "${1:-}" == --yes ]] && yes=1
+    local -a files=()
+    for f in "${SELF_PATH}" "${SELF_PATH}.prev" "${APT_HOOK_FILE}" "${AI_CONF}"; do
+        [[ -e "${f}" ]] && files+=("${f}")
+    done
+    echo "Désinstallation de jeehelp. Seront supprimés :"
+    if [[ ${#files[@]} -gt 0 ]]; then printf '  %s\n' "${files[@]}"; else echo "  (aucun fichier)"; fi
+    echo "  + le message « restart-check » de jeehelp dans le centre de messages Jeedom"
+    echo "  + une vérification après mise à jour encore programmée (timer systemd)"
+    echo "Conservés : ${AUDIT_LOG}, rapports jeehelp_rapport_* dans ${LOG_DIR}, sauvegardes."
+    if [[ ${yes} -eq 0 ]]; then
+        [[ -t 0 ]] || { echo "Sans terminal : relancer avec --yes pour confirmer." >&2; return 1; }
+        confirm "Désinstaller jeehelp" || { echo "Annulé."; return 1; }
+    fi
+    systemctl stop jeehelp-restart-check.timer jeehelp-restart-check.service >/dev/null 2>&1
+    _jee_php 'message::removeAll("jeehelp", "restart-check");' >/dev/null
+    log_action "jeehelp désinstallé (${files[*]})"
+    rm -f -- "${files[@]}"
+    rmdir "$(dirname "${AI_CONF}")" 2>/dev/null
+    echo "✔ jeehelp désinstallé."
+}
+
 # jeehelp --self-update [--branch NOM] [--yes] : met à jour /usr/local/bin/jeehelp depuis GitHub.
 # Le code est exécuté en root : téléchargement HTTPS depuis le dépôt fixe, contrôle de syntaxe,
 # aperçu (empreintes, lignes modifiées, dernier commit) et confirmation avant remplacement.
@@ -3871,6 +3933,9 @@ cli_mode() {
             shift
             ask_ai "$@"
             rc=$? ;;
+        --uninstall)
+            jeehelp_uninstall "${2:-}"
+            rc=$? ;;
         --fix-perms)
             echo "[CLI] Rétablissement des droits..."
             fix_permissions "cli"
@@ -3902,6 +3967,7 @@ cli_mode() {
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
             echo "  --restart-check     Services et démons restés sur d'anciennes bibliothèques (code retour : 0 aucun, 1 à relancer)"
+            echo "  --uninstall [--yes] Retirer jeehelp, son hook apt, sa configuration IA et son message Jeedom"
             exit 1 ;;
     esac
     exit $rc
