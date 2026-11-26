@@ -7,7 +7,9 @@
 #  CLI        : sudo bash jeedom-menu.sh --backup
 #               sudo bash jeedom-menu.sh --repair-db
 #               sudo bash jeedom-menu.sh --check
+#               sudo bash jeedom-menu.sh --disk
 #               sudo bash jeedom-menu.sh --upgrade-security
+#               sudo bash jeedom-menu.sh --restart-check
 # ============================================================
 
 # ── Constantes ───────────────────────────────────────────────
@@ -124,7 +126,14 @@ read_key() {
                 *)    KEY_RESULT="esc"   ;;
             esac
             ;;
-        $'\n'|$'\r'|'')  KEY_RESULT="enter"  ;;
+        $'\r')
+            # Certains terminaux envoient \r\n pour une seule touche Entrée :
+            # avaler le \n résiduel pour qu'il ne soit pas lu comme réponse
+            # au prochain read -rsn1 (ex. confirm() derrière un item de menu).
+            KEY_RESULT="enter"
+            read -rsn1 -t 0.05 _ 2>/dev/null
+            ;;
+        $'\n'|'')  KEY_RESULT="enter"  ;;
         $'\x03')          KEY_RESULT="ctrlc"  ;;
         $'\x04')          KEY_RESULT="ctrld"  ;;
         *)                KEY_RESULT="$key"   ;;
@@ -397,7 +406,7 @@ _watchdog_check() {
         || { echo -e "  ${R}✘${N} Daemon Jeedom introuvable"; rc=1; }
     local pct; pct=$(df "${JEEDOM_DIR}" | awk 'NR==2{gsub(/%/,""); print $5}')
     if [[ $pct -ge 90 ]]; then
-        echo -e "  ${R}⚠  Disque ${pct}% utilisé !${N}"; rc=1
+        echo -e "  ${R}⚠  Disque ${pct}% utilisé ! Origine : sudo jeehelp --disk${N}"; rc=1
     else
         echo -e "  ${G}✔${N} Disque ${pct}% utilisé"
     fi
@@ -612,9 +621,17 @@ show_health() {
     # ── Disque ──
     local disk_pct; disk_pct=$(df "${JEEDOM_DIR}" | awk 'NR==2{gsub(/%/,""); print $5}')
     local disk_info; disk_info=$(df -h "${JEEDOM_DIR}" | awk 'NR==2{print $3"/"$2" ("$5")"}')
-    if   [[ $disk_pct -ge 90 ]]; then _chk "Disque"    err  "$disk_info"
-    elif [[ $disk_pct -ge 75 ]]; then _chk "Disque"    warn "$disk_info"
+    if   [[ $disk_pct -ge 90 ]]; then _chk "Disque"    err  "$disk_info → origine : sudo jeehelp --disk"
+    elif [[ $disk_pct -ge 75 ]]; then _chk "Disque"    warn "$disk_info → origine : sudo jeehelp --disk"
     else                               _chk "Disque"    ok   "$disk_info"
+    fi
+    # tmpfs Jeedom (cache, PID des démons) : plein, Jeedom se bloque sans que le disque le soit
+    if mountpoint -q /tmp/jeedom 2>/dev/null; then
+        local tj_pct; tj_pct=$(df -P /tmp/jeedom | awk 'NR==2{gsub(/%/,""); print $5}')
+        if   [[ $tj_pct -ge 90 ]]; then _chk "tmpfs /tmp/jeedom" err  "${tj_pct}% utilisé"
+        elif [[ $tj_pct -ge 75 ]]; then _chk "tmpfs /tmp/jeedom" warn "${tj_pct}% utilisé"
+        else                             _chk "tmpfs /tmp/jeedom" ok   "${tj_pct}% utilisé"
+        fi
     fi
 
     # ── RAM ──
@@ -710,6 +727,12 @@ show_health() {
     elif [[ $apt_security -ge 1 ]]; then _chk "Mises à jour sécurité" warn "${apt_security} paquet(s) debian-security en attente"
     else                                  _chk "Mises à jour sécurité" ok   "aucune"
     fi
+
+    # Processus restés sur d'anciennes bibliothèques (mise à jour faite, pas relancés).
+    local stale; stale=$(_stale_summary short)
+    [[ -n "${stale}" ]] \
+        && _chk "Processus à relancer" warn "${stale} (détail : jeehelp --restart-check)" \
+        || _chk "Processus à relancer" ok   "aucun"
 
     # ── Résumé ──
     echo
@@ -1420,12 +1443,14 @@ menu_updates() {
         "🧪  Simuler les mises à jour de sécurité (sans rien appliquer)"
         "📊  Statut unattended-upgrades"
         "🛡️   Appliquer les mises à jour de sécurité maintenant"
+        "♻️   Processus à relancer après mise à jour"
+        "🔔  Vérification automatique après mise à jour (hook apt)"
         "↩  Retour"
     )
     while true; do
         nav_menu "Mises à jour & Sécurité" "${opts[@]}"
         case $MENU_RESULT in
-            -1|7) return ;;
+            -1|9) return ;;
             0) header; section "Vérification des mises à jour"
                # update::checkAllUpdate() + refreshUpdateMessage() = action
                # exacte de l'ajax core update.ajax.php?action=checkAllUpdate.
@@ -1458,11 +1483,14 @@ menu_updates() {
                    echo -e "\n${R}✘ Échec lors de la mise à jour système (update ou upgrade).${N}"
                    log_action "apt upgrade ÉCHEC"
                fi
+               echo; _stale_check interactive
                pause ;;
             3) _unattended_setup  ;;
             4) _unattended_dryrun ;;
             5) _unattended_status ;;
             6) _upgrade_security interactive ;;
+            7) header; _stale_check interactive; pause ;;
+            8) _apt_hook_setup ;;
         esac
     done
 }
@@ -1522,6 +1550,8 @@ _unattended_setup() {
             echo -e "\n${G}✔ Configuré — sans redémarrage automatique (un redémarrage manuel reste nécessaire après une mise à jour du noyau).${N}"
         fi
         log_action "unattended-upgrades configuré"
+        [[ -z "$(_apt_hook_mode)" ]] && echo -e "${DIM}Conseil : Mises à jour › Vérification automatique après mise à jour signale les services
+restés sur l'ancienne version après les mises à jour faites la nuit.${N}"
     else
         echo -e "\n${R}✘ Configuration incomplète — voir les échecs ci-dessus.${N}"
         log_action "unattended-upgrades configuré avec erreurs"
@@ -1578,8 +1608,278 @@ _upgrade_security() {
         fi
         log_action "upgrade-security (${mode}, repli apt-get upgrade --only-upgrade, rc=${rc})"
     fi
+    echo
+    _stale_check "${mode}"
     [[ "$mode" == "interactive" ]] && pause
     return $rc
+}
+
+# ============================================================
+#  Processus restés sur d'anciennes bibliothèques après une mise à jour
+# ============================================================
+#  Équivalent minimal de needrestart, sans dépendance. apt remplace les
+#  fichiers sur disque, mais un processus déjà lancé garde l'ancienne version
+#  en mémoire : /proc/<pid>/maps la marque alors « (deleted) ». Le correctif
+#  n'est réellement appliqué qu'après la relance du processus.
+#  Limite : seuls les binaires et bibliothèques sont vus, pas le code
+#  interprété (.py, .php) mis à jour.
+#
+#  Sortie de _stale_scan : une ligne par cible, sans doublon, « type|nom » :
+#    service|<unit>   service systemd à relancer (systemctl restart)
+#    sensible|<unit>  relance qui coupe réseau ou sessions : reboot conseillé
+#    plugin|<id>      démon d'un plugin Jeedom. Jeedom les lance sous le
+#                     cgroup de cron.service (KillMode=process) : relancer
+#                     cron ne les relance pas, il faut passer par Jeedom.
+#    systemd|1        PID 1 : systemctl daemon-reexec ou reboot
+#    process|<nom>    autre processus sans service propre
+#  Les sessions utilisateur (user.slice) sont ignorées : se reconnecter suffit.
+readonly _STALE_SENSITIVE='^(dbus|systemd-logind|NetworkManager|networking|systemd-networkd|wpa_supplicant|lightdm|gdm3?|sddm|display-manager|(serial-)?getty@.*|user@.*)\.service$'
+
+_stale_scan() {
+    local m pid cg unit cmd
+    local -A main=() km=()
+    for m in /proc/[0-9]*/maps; do
+        grep -qE ' /(usr/)?(lib|lib64|bin|sbin|libexec)/[^ ]* \(deleted\)$' "$m" 2>/dev/null || continue
+        pid=${m#/proc/}; pid=${pid%/maps}
+        [[ "${pid}" == 1 ]] && { echo "systemd|1"; continue; }
+        cg=$(grep -m1 '^0::' "/proc/${pid}/cgroup" 2>/dev/null); cg=${cg#0::}
+        [[ "${cg}" == /user.slice/* ]] && continue
+        cmd=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+        # Tâches du core relancées chaque minute (jeeCron...) : se renouvellent seules.
+        [[ "${cmd}" == *"${JEEDOM_DIR}/core/php/"* ]] && continue
+        if [[ "${cmd}" =~ ${JEEDOM_DIR}/plugins/([A-Za-z0-9_]+)/ ]]; then
+            echo "plugin|${BASH_REMATCH[1]}"; continue
+        fi
+        unit=$(grep -oE '[^/]+\.service' <<< "${cg}" | head -1)
+        if [[ "${cg}" == /system.slice/* && -n "${unit}" ]]; then
+            if [[ -z "${km[${unit}]+x}" ]]; then
+                km[${unit}]=$(systemctl show -p KillMode --value "${unit}" 2>/dev/null)
+                main[${unit}]=$(systemctl show -p MainPID --value "${unit}" 2>/dev/null)
+            fi
+            # KillMode=process : la relance ne touche que le processus
+            # principal, un enfant détaché resterait sur l'ancienne version.
+            if [[ "${km[${unit}]}" != process || "${main[${unit}]}" == "${pid}" ]]; then
+                [[ "${unit}" =~ ${_STALE_SENSITIVE} ]] && echo "sensible|${unit}" || echo "service|${unit}"
+                continue
+            fi
+        fi
+        echo "process|$(cat "/proc/${pid}/comm" 2>/dev/null) (pid ${pid})"
+    done | sort -u
+}
+
+#  Relance le démon d'un plugin par Jeedom (deamon_start forcé). Affiche
+#  l'état obtenu ou l'erreur ; code retour 0 si relancé.
+_stale_restart_plugin() {
+    _jee_php_env "JH_PLUGIN=$1" '
+        try {
+            $p = plugin::byId(getenv("JH_PLUGIN"));
+            if ($p->getHasOwnDeamon() != 1) { echo "pas de démon géré par Jeedom"; exit(1); }
+            $p->deamon_start(true);
+            echo "état : " . $p->deamon_info()["state"];
+        } catch (Throwable $e) { echo $e->getMessage(); exit(1); }'
+}
+
+#  Résumé d'une ligne (vide si rien) : « short » donne des compteurs (Santé),
+#  « full » la liste par catégorie (rapport).
+_stale_summary() {
+    local fmt="${1:-short}" lines
+    lines=$(_stale_scan)
+    [[ -z "${lines}" ]] && return 0
+    awk -F'|' -v fmt="${fmt}" '
+        { n[$1]++; l[$1] = l[$1] (l[$1] ? " " : "") $2 }
+        END {
+            split("service plugin sensible systemd process", o, " ")
+            lab["service"] = "service(s)"; lab["plugin"] = "démon(s) de plugin"
+            lab["sensible"] = "sensible(s) (reboot conseillé)"; lab["process"] = "autre(s)"
+            for (i = 1; i <= 5; i++) {
+                k = o[i]; if (!(k in n)) continue
+                if (k == "systemd")    t = "systemd (PID 1)"
+                else if (fmt == "short") t = n[k] " " lab[k]
+                else                   t = lab[k] " : " l[k]
+                out = out (out == "" ? "" : (fmt == "short" ? ", " : " ; ")) t
+            }
+            print out
+        }' <<< "${lines}"
+}
+
+#  Affiche les processus à relancer ; en mode interactif, propose de relancer
+#  services et démons de plugins, chacun après confirmation (jamais de reboot).
+#  Renvoie 0 si rien n'est à relancer, 1 sinon (avant relance éventuelle).
+_stale_check() {
+    local mode="${1:-interactive}" lines kind name u out pid1=0
+    local -a svc=() sens=() plug=() other=()
+    lines=$(_stale_scan)
+    while IFS='|' read -r kind name; do
+        case "${kind}" in
+            service)  svc+=("${name}") ;;
+            sensible) sens+=("${name}") ;;
+            plugin)   plug+=("${name}") ;;
+            systemd)  pid1=1 ;;
+            process)  other+=("${name}") ;;
+        esac
+    done <<< "${lines}"
+    section "Processus restés sur d'anciennes bibliothèques"
+    if [[ -z "${lines}" ]]; then
+        echo -e "${G}✔ Aucun : tous les processus utilisent les bibliothèques à jour.${N}"
+        return 0
+    fi
+    [[ ${#svc[@]}   -gt 0 ]] && echo -e "${W}Services à relancer :${N} ${svc[*]}"
+    [[ ${#plug[@]}  -gt 0 ]] && echo -e "${W}Démons de plugins Jeedom :${N} ${plug[*]}"
+    [[ ${#sens[@]}  -gt 0 ]] && echo -e "${Y}Relance délicate (réseau, sessions), redémarrage de la box conseillé :${N} ${sens[*]}"
+    [[ ${pid1} -eq 1 ]]      && echo -e "${Y}systemd (PID 1) :${N} systemctl daemon-reexec, ou redémarrage de la box"
+    [[ ${#other[@]} -gt 0 ]] && echo -e "${DIM}Autres processus sans service propre :${N} ${other[*]}"
+    echo -e "${DIM}Une mise à jour de sécurité ne protège un processus qu'après sa relance.${N}"
+    [[ "${mode}" == interactive ]] || return 1
+
+    if [[ ${#svc[@]} -gt 0 ]]; then
+        echo
+        if confirm "Relancer les ${#svc[@]} service(s)"; then
+            for u in "${svc[@]}"; do
+                if systemctl restart "${u}" 2>&1; then
+                    echo -e "  ${G}✔${N} ${u}"; log_action "relance ${u} (bibliothèques mises à jour)"
+                else
+                    echo -e "  ${R}✘${N} ${u}"; log_action "relance ${u} ÉCHEC"
+                fi
+            done
+        fi
+    fi
+    if [[ ${#plug[@]} -gt 0 ]]; then
+        echo
+        if confirm "Relancer les démons de ${#plug[@]} plugin(s)"; then
+            for u in "${plug[@]}"; do
+                if out=$(_stale_restart_plugin "${u}"); then
+                    echo -e "  ${G}✔${N} ${u} (${out})"; log_action "relance démon ${u} (bibliothèques mises à jour)"
+                else
+                    echo -e "  ${R}✘${N} ${u} : ${out}"; log_action "relance démon ${u} ÉCHEC : ${out}"
+                fi
+            done
+        fi
+    fi
+    return 1
+}
+
+# ============================================================
+#  Hook apt : vérification après chaque mise à jour, y compris nocturne
+# ============================================================
+#  unattended-upgrades installe en tâche de fond : sans ce hook, personne ne
+#  voit les services restés sur l'ancienne version. Le fichier APT_HOOK_FILE
+#  fait appeler « jeehelp --apt-hook <mode> » par dpkg après chaque passage.
+#  Modes : log  = journal jeehelp + message dans le centre de messages Jeedom
+#          auto = idem, après relance des seuls services sûrs (Apache, Nginx,
+#                 PHP-FPM) et des démons de plugins Jeedom. MariaDB, SSH et
+#                 les autres restent signalés, jamais relancés sans l'admin.
+readonly APT_HOOK_FILE="/etc/apt/apt.conf.d/99jeehelp-restart-check"
+readonly _STALE_AUTO_SAFE='^(apache2|nginx|php[0-9.]*-fpm)\.service$'
+
+_apt_hook_mode() {  # log|auto, ou rien si le hook n'est pas installé
+    [[ -f "${APT_HOOK_FILE}" ]] || return 0
+    grep -oE -- '--apt-hook (log|auto)' "${APT_HOOK_FILE}" | head -1 | cut -d' ' -f2
+}
+
+#  dpkg/apt en cours : leurs verrous POSIX apparaissent dans /proc/locks
+#  (« ... maj:min:inode ... »). Sans fuser/lsof, qui ne sont pas toujours là.
+_dpkg_busy() {
+    local f ino
+    for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock; do
+        ino=$(stat -c %i "${f}" 2>/dev/null) || continue
+        grep -qE ":${ino} " /proc/locks && return 0
+    done
+    return 1
+}
+
+#  Appelé par dpkg : doit rendre la main tout de suite. La vérification part
+#  dans un timer systemd transitoire, hors du cgroup d'apt-daily-upgrade.service
+#  (qui tuerait un simple processus en arrière-plan à sa fin). Le nom d'unité
+#  fixe sert de verrou : dpkg est appelé plusieurs fois par mise à jour, une
+#  seule vérification part.
+_apt_hook() {
+    local mode="$1"
+    [[ "${mode}" == auto ]] || mode=log
+    systemd-run --quiet --no-block --collect --unit=jeehelp-restart-check \
+        --on-active=60 --timer-property=AccuracySec=5s --timer-property=RemainAfterElapse=no \
+        "${_SELF}" --apt-hook-run "${mode}" >/dev/null 2>&1
+    return 0
+}
+
+#  Vérification lancée par le timer, une fois apt/dpkg terminés (30 min max).
+#  Remplace le message Jeedom précédent ; l'efface s'il n'y a plus rien.
+_apt_hook_run() {
+    local mode="$1" i kind name out summary msg
+    local -a restarted=() failed=()
+    for ((i = 0; i < 180; i++)); do _dpkg_busy || break; sleep 10; done
+    if [[ "${mode}" == auto ]]; then
+        while IFS='|' read -r kind name; do
+            if [[ "${kind}" == service && "${name}" =~ ${_STALE_AUTO_SAFE} ]]; then
+                # Config invalide = Apache/Nginx ne redémarrerait pas : on laisse tourner.
+                if [[ "${name}" == apache2.service ]] && ! apache2ctl configtest >/dev/null 2>&1; then
+                    failed+=("${name} (apache2ctl configtest en échec)"); continue
+                fi
+                if [[ "${name}" == nginx.service ]] && ! nginx -t >/dev/null 2>&1; then
+                    failed+=("${name} (nginx -t en échec)"); continue
+                fi
+                if systemctl restart "${name}" >/dev/null 2>&1; then restarted+=("${name}"); else failed+=("${name}"); fi
+            elif [[ "${kind}" == plugin ]]; then
+                if out=$(_stale_restart_plugin "${name}"); then restarted+=("${name}"); else failed+=("${name} (${out})"); fi
+            fi
+        done < <(_stale_scan)
+        [[ ${#restarted[@]} -gt 0 ]] && log_action "apt-hook : relancés automatiquement : ${restarted[*]}"
+        [[ ${#failed[@]}    -gt 0 ]] && log_action "apt-hook : échec de relance : ${failed[*]}"
+    fi
+    summary=$(_stale_summary full)
+    _jee_php 'message::removeAll("jeehelp", "restart-check");' >/dev/null
+    if [[ -z "${summary}" ]]; then
+        log_action "apt-hook (${mode}) : aucun processus à relancer"
+        return 0
+    fi
+    log_action "apt-hook (${mode}) : à relancer : ${summary}"
+    msg="Après une mise à jour, des processus utilisent encore d'anciennes bibliothèques : le correctif ne les protège qu'après relance. ${summary}. Pour les relancer : sudo jeehelp, menu Mises à jour, Processus à relancer."
+    [[ ${#restarted[@]} -gt 0 ]] && msg="Relancés automatiquement : ${restarted[*]}. ${msg}"
+    _jee_php_env "JH_MSG=${msg}" 'message::add("jeehelp", getenv("JH_MSG"), "", "restart-check");' >/dev/null
+    return 1
+}
+
+_apt_hook_setup() {
+    local cur mode
+    cur=$(_apt_hook_mode)
+    local -a opts=(
+        "Désactivée"
+        "Signaler seulement (journal jeehelp + message dans Jeedom)"
+        "Signaler, et relancer Apache/Nginx, PHP-FPM et les démons de plugins"
+        "↩  Retour"
+    )
+    case "${cur}" in
+        "")   opts[0]+="   ✔ actuel" ;;
+        log)  opts[1]+="   ✔ actuel" ;;
+        auto) opts[2]+="   ✔ actuel" ;;
+    esac
+    nav_menu "Vérification automatique après mise à jour (hook apt)" "${opts[@]}"
+    case $MENU_RESULT in
+        -1|3) return ;;
+        0) mode="" ;;
+        1) mode=log ;;
+        2) mode=auto ;;
+    esac
+    header; section "Vérification automatique après mise à jour"
+    if [[ -z "${mode}" ]]; then
+        rm -f "${APT_HOOK_FILE}"
+        echo -e "${G}✔ Désactivée${N} (${APT_HOOK_FILE} supprimé)."
+        log_action "hook apt désactivé"
+        pause; return
+    fi
+    # Pas de guillemet double possible dans une chaîne apt.conf.
+    { echo "// Installé par jeehelp (menu Mises à jour) : après chaque mise à jour, repère les"
+      echo "// processus restés sur d'anciennes bibliothèques. Supprimer ce fichier pour désactiver."
+      echo "DPkg::Post-Invoke { \"if [ -x ${SELF_PATH} ]; then ${SELF_PATH} --apt-hook ${mode} >/dev/null 2>&1 || true; fi\"; };"
+    } > "${APT_HOOK_FILE}.tmp" && mv "${APT_HOOK_FILE}.tmp" "${APT_HOOK_FILE}"
+    echo -e "${G}✔ Activée (${mode})${N} : ${APT_HOOK_FILE}"
+    echo -e "\nAprès chaque mise à jour (apt, unattended-upgrades), jeehelp attend la fin d'apt,"
+    echo -e "puis note le résultat dans ${AUDIT_LOG} et, s'il reste des processus à relancer,"
+    echo -e "dans le centre de messages de Jeedom."
+    [[ "${mode}" == auto ]] && echo -e "Apache/Nginx, PHP-FPM et les démons de plugins sont relancés automatiquement ;
+${Y}MariaDB, SSH et les autres services restent seulement signalés.${N}"
+    [[ -x "${SELF_PATH}" ]] || echo -e "\n${Y}⚠ jeehelp n'est pas installé dans ${SELF_PATH} : le hook ne fera rien (sudo bash install.sh).${N}"
+    log_action "hook apt activé (${mode})"
+    pause
 }
 
 # ============================================================
@@ -1645,9 +1945,7 @@ menu_cleanup() {
                        || echo -e "${Y}Annulé.${N}"
                fi; pause ;;
             1) _cleanup_tmp ;;
-            2) header; section "Espace disque"
-               du -sh "${JEEDOM_DIR}/"* 2>/dev/null | sort -rh | head -10
-               echo; df -h /; pause ;;
+            2) menu_disk ;;
             3) header; section "OPcache PHP"
                php -r "opcache_reset() ? print 'OPcache vidé.\n' : print 'OPcache N/A.\n';" 2>/dev/null
                pause ;;
@@ -1655,6 +1953,579 @@ menu_cleanup() {
                apt-get autoremove -y 2>&1; pause ;;
         esac
     done
+}
+
+# ============================================================
+#  8b — ANALYSE DE L'ESPACE DISQUE  (Nettoyage, --disk, rapport)
+# ============================================================
+#  But : nommer l'origine d'un disque plein, pas seulement son pourcentage.
+#  Une passe find|awk par système de fichiers (-xdev, nice/ionice) donne la
+#  taille et le nombre de fichiers de chaque dossier (liens durs comptés une
+#  fois, comme du), les gros fichiers et ceux modifiés depuis 24 h. S'y ajoute
+#  ce qu'un du ne voit pas : fichiers supprimés mais encore ouverts (place
+#  rendue seulement quand le processus les ferme) et fichiers masqués sous un
+#  point de montage (écrits avant le montage d'un NAS/USB). Lecture seule.
+#  Aucun fichier temporaire sur disque : le disque analysé peut être plein.
+
+declare -ga _DISK_FINDINGS=()   # "ERR|WARN|INFO" "|libellé|détail"
+declare -g  _DISK_BIND=""
+
+# Entrée : find -printf '%b\t%n\t%i\t%T@\t%y\t%p\n'. Compatible mawk (pas
+# d'intervalle {n} dans les regex, pas de tri interne). Sorties (tabulées) :
+#   TOT total_ko nb_fichiers ko_24h nb_24h      P/RP/IP valeur chemin (chaîne dominante)
+#   N clé_de_tri profondeur ko nb chemin      (arbre, frères triés par taille)
+#   E parent ko nb ko_24h chemin               (enfants des dossiers « expand » et du dominant)
+#   H ko nb chemin    F ko mtime chemin    R ko mtime chemin
+readonly _DK_SCAN_AWK='
+function slashes(s) { return gsub(/\//, "/", s) }
+function par(k,   q) { q = k; sub(/\/[^\/]*$/, "", q); return (q == "") ? "/" : q }
+function chain(tag, a, thr,   k, pa, bs, bk, cur, d) {
+    for (k in a) { if (k == root) continue; pa = par(k); if (a[k] > bs[pa]) { bs[pa] = a[k]; bk[pa] = k } }
+    cur = root; d = 0; printf "%s\t%.0f\t%s\n", tag, a[cur], cur
+    while ((cur in bk) && a[bk[cur]] >= thr * a[cur] && d < maxd) { cur = bk[cur]; d++; printf "%s\t%.0f\t%s\n", tag, a[cur], cur }
+    return cur
+}
+BEGIN {
+    FS = "\t"; rl = (root == "/") ? 0 : length(root); pfx = (root == "/") ? "" : root
+    rsl = (root == "/") ? 0 : slashes(root); lim = now - 86400
+    n = split(hot, t, "|"); for (i = 1; i <= n; i++) if (t[i] != "") ishot[t[i]] = 1
+    n = split(expand, t, "|"); for (i = 1; i <= n; i++) if (t[i] != "") isexp[t[i]] = 1
+}
+{
+    y = $5; p = $0; for (j = 0; j < 5; j++) p = substr(p, index(p, "\t") + 1)
+    if ($2 > 1 && y != "d") { if ($3 in seen) next; seen[$3] = 1 }
+    kb = $1 / 2; tot += kb; nfi++
+    rec = (y == "f" && $4 >= lim); if (rec) { rtot += kb; rcnt++; rs[root] += kb }
+    sz[root] += kb; nf[root]++
+    if (p != root) {
+        m = split(substr(p, rl + 1), c, "/"); last = (y == "d") ? m : m - 1
+        if (last > maxd + 1) last = maxd + 1
+        pre = pfx
+        for (i = 2; i <= last; i++) { pre = pre "/" c[i]; sz[pre] += kb; nf[pre]++; if (rec) rs[pre] += kb }
+    }
+    if (y == "f" && kb >= bigmin) printf "F\t%.0f\t%.0f\t%s\n", kb, $4, p
+    if (rec && kb >= recmin) printf "R\t%.0f\t%.0f\t%s\n", kb, $4, p
+}
+END {
+    printf "TOT\t%.0f\t%.0f\t%.0f\t%.0f\n", tot, nfi, rtot, rcnt
+    end = chain("P", sz, 0.5)
+    if (rtot > 0) chain("RP", rs, 0.5)
+    if (inodes) chain("IP", nf, 0.5)
+    tmin = used * 0.02; if (tmin < 51200) tmin = 51200
+    for (k in sz) {
+        if (k in ishot) printf "H\t%.0f\t%.0f\t%s\n", sz[k], nf[k], k
+        if (k == root) { printf "N\t\t0\t%.0f\t%.0f\t%s\n", sz[k], nf[k], k; continue }
+        pa = par(k)
+        if ((pa in isexp) || (pa == end && end != root)) printf "E\t%s\t%.0f\t%.0f\t%.0f\t%s\n", pa, sz[k], nf[k], rs[k] + 0, k
+        d = slashes(k) - rsl
+        if (d > treed || sz[k] < tmin) continue
+        key = ""; m = split(substr(k, rl + 1), c, "/"); pre = pfx
+        for (i = 2; i <= m; i++) { pre = pre "/" c[i]; key = key sprintf("%015.0f", 1e14 - sz[pre]) c[i] "\001" }
+        printf "N\t%s\t%d\t%.0f\t%.0f\t%s\n", key, d, sz[k], nf[k], k
+    }
+}'
+
+_dk_hs() {  # Ko → taille lisible (une décimale)
+    local k=${1:-0} d u
+    k=${k%.*}; [[ "${k}" =~ ^[0-9]+$ ]] || k=0
+    if   (( k >= 1073741824 )); then d=$(( k * 10 / 1073741824 )); u=To
+    elif (( k >= 1048576 ));    then d=$(( k * 10 / 1048576 ));    u=Go
+    elif (( k >= 1024 ));       then d=$(( k * 10 / 1024 ));       u=Mo
+    else printf '%s Ko' "${k}"; return; fi
+    printf '%s.%s %s' "$(( d / 10 ))" "$(( d % 10 ))" "${u}"
+}
+_dk_pct() { local a=${1%.*} b=${2%.*}; (( ${b:-0} > 0 )) && echo $(( (${a:-0} * 100 + b / 2) / b )) || echo 0; }
+_dk_bar() {
+    local p=${1:-0} w=${2:-20} n s="" i
+    n=$(( (p * w + 50) / 100 )); (( n > w )) && n=${w}
+    for (( i = 0; i < w; i++ )); do (( i < n )) && s+="█" || s+="·"; done
+    printf '%s' "${s}"
+}
+_dk_find() { _DISK_FINDINGS+=("$1|$2|$3"); }
+_dk_is_net() { [[ "$1" =~ ^(nfs4?|cifs|smb3|smbfs|9p|ceph|glusterfs|davfs|fuse\..*)$ ]]; }
+
+# point de montage, type, taille, utilisé, libre (Ko), %, % inodes, source — séparés par \x1f
+# (une tabulation est un blanc pour read : un champ vide, ex. inodes d'un vfat, décalerait la suite).
+# Pseudo-systèmes exclus ; tmpfs gardés seulement sous /tmp (dont /tmp/jeedom).
+# df borné : un partage réseau figé ne doit pas bloquer l'analyse (repli -l).
+_dk_fslist() {
+    LC_ALL=C awk -v pseudo=" devtmpfs overlay squashfs efivarfs ramfs nsfs autofs tracefs fuse.lxcfs " '
+        FNR == 1 { f++; next }
+        f == 1 { ip[$NF] = $5; next }
+        {
+            t = $2; mp = $NF
+            if (index(pseudo, " " t " ") || $3 + 0 == 0) next
+            if (t == "tmpfs" && mp !~ /^\/tmp(\/|$)/) next
+            pc = $6; sub(/%/, "", pc); ic = ip[mp]; sub(/%/, "", ic); if (ic == "-") ic = ""
+            o[mp] = mp "\037" t "\037" $3 "\037" $4 "\037" $5 "\037" pc "\037" ic "\037" $1
+            if (!(mp in s)) { s[mp] = 1; ord[++n] = mp }
+        }
+        END { for (i = 1; i <= n; i++) print o[ord[i]] }
+    ' <(timeout 10 df -Pi 2>/dev/null || timeout 10 df -Pil 2>/dev/null) \
+      <(timeout 10 df -PTk 2>/dev/null || timeout 10 df -PTkl 2>/dev/null)
+}
+
+# périphérique \t pid \t Ko \t /proc/pid/fd/n  — par (périphérique, processus),
+# chaque fichier compté une fois même s'il est ouvert par plusieurs processus.
+_dk_deleted() {
+    find -L /proc/[0-9]*/fd -mindepth 1 -maxdepth 1 -type f -links 0 -printf '%D\t%i\t%b\t%p\n' 2>/dev/null \
+        | LC_ALL=C awk -F'\t' '!s[$1 ":" $2]++ { split($4, a, "/"); k = $1 "\t" a[3]; t[k] += $3 / 2; if (!(k in f)) f[k] = $4 }
+            END { for (k in t) if (t[k] >= 10240) printf "%s\t%.0f\t%s\n", k, t[k], f[k] }'
+}
+
+_dk_unbind() {
+    [[ -n "${_DISK_BIND}" ]] || return 0
+    umount "${_DISK_BIND}" 2>/dev/null || umount -l "${_DISK_BIND}" 2>/dev/null
+    rmdir "${_DISK_BIND}" 2>/dev/null
+    _DISK_BIND=""
+}
+
+# Ko \t point de montage, pour chaque montage qui recouvre des fichiers de $1.
+# Montage --bind non récursif et en lecture seule de $1 : les sous-montages n'y
+# sont pas, on voit donc ce qu'ils cachent. Sous-shell avec ses propres traps :
+# démonté même sur Ctrl+C, y compris quand l'appelant est lui-même un $(...).
+# Jamais de rm -rf ici : seulement umount puis rmdir.
+_dk_hidden() (
+    trap '_dk_unbind' EXIT
+    trap '_dk_unbind; exit 130' INT
+    trap '_dk_unbind; exit 143' TERM
+    local mp="$1" b sub rel kb c skip
+    local -a counted=()
+    command -v findmnt &>/dev/null || return 1
+    b=$(mktemp -d /run/jeehelp-disk.XXXXXX 2>/dev/null) || return 1
+    _DISK_BIND="${b}"
+    if ! mount --bind -o ro "${mp}" "${b}" 2>/dev/null; then rmdir "${b}" 2>/dev/null; _DISK_BIND=""; return 1; fi
+    while IFS= read -r sub; do
+        if [[ "${mp}" == / ]]; then rel="${sub}"
+        else [[ "${sub}" == "${mp}"/* ]] || continue; rel="${sub#"${mp}"}"; fi
+        [[ -z "${rel}" || "${rel}" == / || "${sub}" == "${b}"* ]] && continue
+        skip=0; for c in "${counted[@]}"; do [[ "${rel}" == "${c}"/* ]] && { skip=1; break; }; done
+        [[ ${skip} -eq 1 || ! -d "${b}${rel}" ]] && continue
+        counted+=("${rel}")
+        kb=$(timeout 120 du -sxk "${b}${rel}" 2>/dev/null | cut -f1)
+        [[ "${kb}" =~ ^[0-9]+$ && ${kb} -ge 10240 ]] && printf '%s\t%s\n' "${kb}" "${sub}"
+    done < <(findmnt -rno TARGET 2>/dev/null | LC_ALL=C sort -u)
+    _dk_unbind
+    return 0
+)
+
+_dk_scan() {  # point_de_montage utilisé_Ko inodes(0|1) chemins_hot chemins_expand
+    local -a pre=(nice -n 19); command -v ionice &>/dev/null && pre+=(ionice -c3)
+    LC_ALL=C timeout 1800 "${pre[@]}" find "$1" -xdev \( -type f -o -type d \) -printf '%b\t%n\t%i\t%T@\t%y\t%p\n' 2>/dev/null \
+        | LC_ALL=C awk -v root="$1" -v used="$2" -v inodes="$3" -v hot="$4" -v expand="$5" \
+              -v now="$(date +%s)" -v maxd=8 -v treed=4 -v bigmin=51200 -v recmin=51200 "${_DK_SCAN_AWK}"
+}
+
+# Explication + action proposée pour un chemin (rien n'est exécuté).
+_dk_hint() {
+    local p="$1" pl
+    case "${p}" in
+        "${_DK_BKP}"|"${_DK_BKP}"/*|"${BACKUP_DIR}"|"${BACKUP_DIR}"/*)
+            echo "Sauvegardes Jeedom : réduire la rétention (Réglages › Système › Configuration › Sauvegardes) ou supprimer les anciennes archives (menu Sauvegardes)." ;;
+        "${LOG_DIR}"|"${LOG_DIR}"/*)
+            echo "Logs Jeedom : repasser le plugin concerné en niveau de log « Défaut » ou « Aucun », puis vider le log." ;;
+        "${JEEDOM_DIR}/plugins/"*)
+            pl="${p#"${JEEDOM_DIR}/plugins/"}"; pl="${pl%%/*}"
+            case "${p,,}" in
+                *camera*|*record*|*video*|*snapshot*|*capture*)
+                    echo "Enregistrements/captures du plugin ${pl} : réduire leur durée de conservation dans sa configuration. Si leur suppression ne libère rien, voir « fichiers supprimés mais encore ouverts »." ;;
+                *) echo "Données du plugin ${pl} (cache, sauvegardes, enregistrements, dépendances) : vérifier sa configuration de rétention." ;;
+            esac ;;
+        /var/lib/mysql|/var/lib/mysql/*)
+            echo "Base MariaDB : voir les tables les plus lourdes plus bas (historique des commandes)." ;;
+        /var/log/journal|/var/log/journal/*)
+            echo "Journal systemd : sudo journalctl --vacuum-size=200M (limite durable : SystemMaxUse= dans /etc/systemd/journald.conf)." ;;
+        /var/log|/var/log/*)
+            echo "Logs système : un service écrit en boucle (voir le plus gros fichier) ; vérifier logrotate." ;;
+        /var/cache/apt|/var/cache/apt/*)
+            echo "Cache des paquets : sudo apt-get clean." ;;
+        /var/lib/docker|/var/lib/docker/*|/var/lib/containerd|/var/lib/containerd/*)
+            echo "Docker : images, volumes, journaux de conteneurs (docker system df ; docker system prune avec prudence)." ;;
+        /var/crash|/var/crash/*|/var/lib/systemd/coredump|/var/lib/systemd/coredump/*)
+            echo "Rapports de plantage (core dumps) : supprimables après analyse." ;;
+        /tmp|/tmp/*|/var/tmp|/var/tmp/*)
+            echo "Fichiers temporaires : menu Nettoyage › Nettoyer /tmp." ;;
+        /home|/home/*|/root|/root/*)
+            echo "Fichiers personnels (copies de sauvegardes, téléchargements, exports)." ;;
+        /boot|/boot/*)
+            echo "Anciens noyaux : sudo apt autoremove --purge." ;;
+        /usr|/usr/*|/opt|/opt/*)
+            echo "Logiciels installés : rarement la cause d'une hausse soudaine." ;;
+    esac
+}
+
+_dk_mysql() {
+    load_mysql_creds
+    if ! mysql --defaults-extra-file="${DB_OPTFILE}" -N -e "SELECT 1;" &>/dev/null; then
+        echo "  MariaDB injoignable : tailles des tables indisponibles."; return
+    fi
+    local schema tbl bytes free rows
+    echo -e "  ${W}Tables les plus lourdes${N}"
+    while IFS=$'\t' read -r schema tbl bytes free rows; do
+        printf "    %9s  %-34s %s lignes (estim.)%s\n" "$(_dk_hs $(( bytes / 1024 )))" "${schema}.${tbl}" "${rows}" \
+            "$( (( ${free:-0} >= 104857600 )) && printf ', %s récupérables (OPTIMIZE TABLE)' "$(_dk_hs $(( free / 1024 )))")"
+    done < <(mysql_cmd -N -e "SELECT table_schema, table_name, data_length+index_length, data_free, IFNULL(table_rows,0) FROM information_schema.tables WHERE table_type='BASE TABLE' ORDER BY data_length+index_length DESC LIMIT 6;")
+    if [[ "$(mysql_cmd -N -e 'SELECT @@log_bin;')" == 1 ]]; then
+        local bl; bl=$(mysql_cmd -N -e "SHOW BINARY LOGS;" | awk '{s += $2; n++} END {printf "%.0f %d", s / 1024, n}')
+        echo -e "  ${Y}Journaux binaires actifs${N} : $(_dk_hs "${bl% *}") en ${bl#* } fichier(s) (inutiles sans réplication : PURGE BINARY LOGS / expire_logs_days)."
+        (( ${bl% *} >= 1048576 )) && _dk_find WARN "Binlogs MariaDB" "$(_dk_hs "${bl% *}") de journaux binaires"
+    fi
+    local hist; hist=$(mysql_cmd -N -e "SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema='${DB_NAME}' AND table_name IN ('history','historyArch');")
+    [[ "${hist}" =~ ^[0-9]+$ ]] || return
+    echo -e "  ${W}Historique Jeedom${N} (history + historyArch) : $(_dk_hs $(( hist / 1024 )))"
+    (( hist >= 209715200 )) || return
+    echo "  Commandes les plus historisées (régler « Purger l'historique si plus vieux que » dans la configuration avancée de la commande) :"
+    mysql_cmd -N -e "SET STATEMENT max_statement_time=60 FOR
+        SELECT CONCAT(IFNULL(o.name,'-'),' › ',IFNULL(e.name,'?'),' › ',IFNULL(c.name, CONCAT('#',x.cmd_id))), x.n
+        FROM (SELECT cmd_id, SUM(n) n FROM (
+                SELECT cmd_id, COUNT(*) n FROM historyArch GROUP BY cmd_id
+                UNION ALL SELECT cmd_id, COUNT(*) FROM history GROUP BY cmd_id) u
+              GROUP BY cmd_id ORDER BY n DESC LIMIT 5) x
+        LEFT JOIN cmd c ON c.id = x.cmd_id LEFT JOIN eqLogic e ON e.id = c.eqLogic_id LEFT JOIN object o ON o.id = e.object_id;" \
+        | awk -F'\t' '{printf "    %10s valeurs  %s\n", $2, $1}'
+}
+
+_dk_docker() {
+    command -v docker &>/dev/null || return
+    echo -e "  ${W}Docker${N} (docker system df) :"
+    timeout 30 docker system df 2>/dev/null | sed 's/^/    /'
+    local f id name
+    while IFS=$'\t' read -r kb f; do
+        id=$(basename "$(dirname "${f}")")
+        name=$(timeout 5 docker inspect --format '{{.Name}}' "${id}" 2>/dev/null); name="${name#/}"
+        echo "    journal du conteneur ${name:-${id:0:12}} : $(_dk_hs "${kb}")"
+    done < <(find /var/lib/docker/containers -maxdepth 2 -name '*-json.log' -size +100M -printf '%k\t%p\n' 2>/dev/null | sort -rn | head -5)
+}
+
+disk_analysis() {
+    local mode="${1:-cli}"
+    local R="${R}" G="${G}" Y="${Y}" C="${C}" W="${W}" N="${N}" DIM="${DIM}"
+    if [[ "${mode}" == report || ( "${mode}" == cli && ! -t 1 ) ]]; then R='' G='' Y='' C='' W='' N='' DIM=''; fi
+    _DISK_FINDINGS=()
+
+    local fsl; fsl=$(_dk_fslist)
+    [[ -z "${fsl}" ]] && { echo "df indisponible : analyse impossible."; return 2; }
+    local -A fs_t=() fs_sz=() fs_us=() fs_av=() fs_pct=() fs_ipct=() dev_mp=()
+    local -a fs_order=()
+    local mp t sz us av pct ipct src d
+    while IFS=$'\x1f' read -r mp t sz us av pct ipct src; do
+        fs_order+=("${mp}"); fs_t[${mp}]="${t}"; fs_sz[${mp}]="${sz}"; fs_us[${mp}]="${us}"; fs_av[${mp}]="${av}"
+        fs_pct[${mp}]="${pct}"; fs_ipct[${mp}]="${ipct}"
+        _dk_is_net "${t}" && continue
+        d=$(timeout 5 stat -c %d "${mp}" 2>/dev/null) && dev_mp[${d}]="${mp}"
+    done < <(printf '%s\n' "${fsl}")
+
+    # Chemin et rétention réels des sauvegardes (configurables dans Jeedom)
+    local _DK_BKP="${BACKUP_DIR}" keep="" cfg bp
+    cfg=$(_jee_php 'echo "JH|" . config::byKey("backup::path") . "|" . config::byKey("backup::keepDays");' 2>/dev/null | grep '^JH|' | tail -1)
+    if [[ -n "${cfg}" ]]; then
+        IFS='|' read -r _ bp keep <<< "${cfg}"
+        [[ -n "${bp}" ]] && { [[ "${bp}" == /* ]] && _DK_BKP="${bp}" || _DK_BKP="${JEEDOM_DIR}/${bp}"; }
+        _DK_BKP="${_DK_BKP%/}"; [[ "${keep}" =~ ^[0-9]+$ ]] || keep=""
+    fi
+
+    # ── Systèmes de fichiers ──
+    section "Systèmes de fichiers"
+    printf "  %-20s %-6s %9s %9s %9s %6s %7s\n" "Point de montage" "Type" "Taille" "Utilisé" "Libre" "Util." "Inodes"
+    local col label full=0
+    for mp in "${fs_order[@]}"; do
+        t="${fs_t[${mp}]}"; pct="${fs_pct[${mp}]}"; ipct="${fs_ipct[${mp}]}"
+        [[ "${pct}" =~ ^[0-9]+$ ]] || continue
+        av="${fs_av[${mp}]:-0}"
+        col="${G}"; (( pct >= 80 )) && col="${Y}"; (( pct >= 90 )) && col="${R}"
+        printf "  %-20s %-6s %9s %9s %9s ${col}%5s%%${N} %7s  ${col}%s${N}\n" "${mp:0:20}" "${t:0:6}" \
+            "$(_dk_hs "${fs_sz[${mp}]}")" "$(_dk_hs "${fs_us[${mp}]}")" "$(_dk_hs "${av}")" "${pct}" "${ipct:+${ipct}%}" "$(_dk_bar "${pct}" 15)"
+        if [[ "${t}" == tmpfs ]]; then
+            label="tmpfs ${mp}"
+            if [[ "${mp}" == /tmp/jeedom ]] && (( pct >= 75 )); then
+                _dk_find "$( (( pct >= 90 )) && echo ERR || echo WARN)" "${label}" "${pct} % : Jeedom ne peut plus écrire son cache ni ses fichiers PID ; voir son contenu ci-dessous"
+            elif (( pct >= 90 )); then _dk_find WARN "${label}" "${pct} % utilisé (mémoire vive)"; fi
+            continue
+        fi
+        (( pct >= 75 )) && full=1
+        label="Disque ${mp}"
+        if   (( pct >= 90 )); then _dk_find ERR  "${label}" "${pct} % utilisé, $(_dk_hs "${av}") libres sur $(_dk_hs "${fs_sz[${mp}]}")"
+        elif (( pct >= 80 )); then _dk_find WARN "${label}" "${pct} % utilisé, $(_dk_hs "${av}") libres sur $(_dk_hs "${fs_sz[${mp}]}")"; fi
+        if [[ "${ipct}" =~ ^[0-9]+$ ]] && (( ipct >= 80 )); then
+            full=1
+            _dk_find "$( (( ipct >= 90 )) && echo ERR || echo WARN)" "Inodes ${mp}" "${ipct} % : plus aucun fichier ne pourra être créé, même s'il reste de la place"
+        fi
+    done
+    echo -e "  ${DIM}Util. = part de la capacité réellement disponible (blocs réservés à root exclus).${N}"
+
+    # ── Fichiers supprimés mais encore ouverts ──
+    section "Fichiers supprimés mais encore ouverts"
+    local -A del_dev=()
+    local -a del_lines=()
+    local pid kb fd comm unit name plug
+    while IFS=$'\t' read -r d pid kb fd; do
+        [[ -n "${dev_mp[${d}]:-}" ]] || continue   # memfd, pseudo-système : pas d'espace disque
+        # tmpfs (mémoire vive) : signalé seulement s'il est lui-même presque plein
+        [[ "${fs_t[${dev_mp[${d}]}]}" == tmpfs ]] && (( ${fs_pct[${dev_mp[${d}]}]:-0} < 75 )) && continue
+        del_dev[${d}]=$(( ${del_dev[${d}]:-0} + kb ))
+        comm=$(cat "/proc/${pid}/comm" 2>/dev/null)
+        unit=$(ps -o unit= -p "${pid}" 2>/dev/null | tr -d ' ')
+        plug=$(tr '\0' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | grep -o -m1 "${JEEDOM_DIR}/plugins/[^/]*" | head -1)
+        name=$(readlink "${fd}" 2>/dev/null); name="${name% (deleted)}"
+        del_lines+=("${kb}"$'\x1f'"${pid}"$'\x1f'"${comm:-?}"$'\x1f'"${unit:--}"$'\x1f'"${plug##*/}"$'\x1f'"${name}"$'\x1f'"${dev_mp[${d}]}")
+    done < <(_dk_deleted)
+    if [[ ${#del_lines[@]} -eq 0 ]]; then
+        echo -e "  ${G}✔${N} Aucun au-delà de 10 Mo : les fichiers supprimés ont bien rendu leur place."
+    else
+        echo "  Espace encore occupé tant que ces processus gardent les fichiers ouverts :"
+        local who
+        while IFS=$'\x1f' read -r kb pid comm unit plug name mp; do
+            who="${comm} (pid ${pid}"; [[ -n "${plug}" ]] && who+=", plugin ${plug}"; [[ "${unit}" == *.service ]] && who+=", ${unit}"; who+=")"
+            printf "    ${Y}%9s${N}  %-22s %s\n" "$(_dk_hs "${kb}")" "${mp}" "${who}"
+            printf "    %9s  ${DIM}%s${N}\n" "" "${name:0:110}"
+        done < <(printf '%s\n' "${del_lines[@]}" | sort -t$'\x1f' -k1,1nr | head -8)
+        local top; top=$(printf '%s\n' "${del_lines[@]}" | sort -t$'\x1f' -k1,1nr | head -1)
+        IFS=$'\x1f' read -r kb pid comm unit plug name mp <<< "${top}"
+        local fix="redémarrer ce processus"
+        [[ -n "${plug}" ]] && fix="redémarrer le démon du plugin ${plug} (page du plugin)"
+        [[ -z "${plug}" && "${unit}" == *.service && "${unit}" != cron.service ]] && fix="sudo systemctl restart ${unit}"
+        echo -e "  → La place revient dès la fermeture des fichiers : ${W}${fix}${N}."
+        for d in "${!del_dev[@]}"; do
+            mp="${dev_mp[${d}]}"; kb="${del_dev[${d}]}"
+            if (( kb >= 1048576 || kb * 20 >= fs_sz[${mp}] )); then
+                _dk_find ERR "Supprimés mais ouverts (${mp})" "$(_dk_hs "${kb}") retenus, surtout par ${comm} : ${fix}"
+            elif (( kb >= 102400 )); then
+                _dk_find WARN "Supprimés mais ouverts (${mp})" "$(_dk_hs "${kb}") retenus, surtout par ${comm} : ${fix}"
+            fi
+        done
+    fi
+
+    # ── Parcours détaillé des disques concernés ──
+    local light=0
+    [[ "${mode}" == report && ${full} -eq 0 ]] && light=1
+    local -a targets=()
+    local p m
+    for p in / "${JEEDOM_DIR}" "${_DK_BKP}" /var/lib/mysql /var/log; do
+        [[ -e "${p}" ]] || continue
+        m=$(timeout 5 df -P "${p}" 2>/dev/null | awk 'NR==2{print $NF}'); [[ -n "${m}" ]] && targets+=("${m}")
+    done
+    for mp in "${fs_order[@]}"; do
+        [[ "${fs_pct[${mp}]}" =~ ^[0-9]+$ ]] && (( fs_pct[${mp}] >= 80 )) && targets+=("${mp}")
+    done
+    local hot="${_DK_BKP}|${BACKUP_DIR}|${LOG_DIR}|${JEEDOM_DIR}/plugins|${JEEDOM_DIR}/data|/var/lib/mysql|/var/log|/var/log/journal|/var/cache/apt|/var/lib/docker|/var/lib/containerd|/var/tmp|/home|/root|/var/crash|/var/lib/systemd/coredump"
+    local -A hot_kb=() seen_mp=()
+    local -a plug_lines=()
+    local out tot nfi rtot rcnt ttag f1 f2 f3 f4 f5 depth nfc
+    for mp in "${targets[@]}"; do
+        [[ -n "${seen_mp[${mp}]:-}" ]] && continue; seen_mp[${mp}]=1
+        t="${fs_t[${mp}]:-}"; us="${fs_us[${mp}]:-0}"
+        [[ -z "${t}" || "${t}" == tmpfs ]] && continue
+        if _dk_is_net "${t}"; then echo -e "\n  ${DIM}${mp} (${t}, réseau) : non parcouru.${N}"; continue; fi
+        if [[ ${light} -eq 1 ]]; then continue; fi
+        echo -e "  ${DIM}Parcours de ${mp} ($(_dk_hs "${us}") utilisés, 1 à 3 min sur eMMC/SD)...${N}" >&2
+        ipct="${fs_ipct[${mp}]}"
+        out=$(_dk_scan "${mp}" "${us}" "$( [[ "${ipct}" =~ ^[0-9]+$ ]] && (( ipct >= 80 )) && echo 1 || echo 0)" "${hot}" "${JEEDOM_DIR}/plugins")
+        IFS=$'\t' read -r _ tot nfi rtot rcnt < <(printf '%s\n' "${out}" | grep -m1 '^TOT')
+        [[ "${tot}" =~ ^[0-9]+$ && ${tot} -gt 0 ]] || { echo "  ${mp} : parcours impossible."; continue; }
+
+        while IFS=$'\t' read -r ttag f1 f2 f3; do
+            case "${ttag}" in
+                H) hot_kb[${f3}]="${f1}" ;;
+                E) [[ "${f1}" == "${JEEDOM_DIR}/plugins" ]] && plug_lines+=("${f2}"$'\t'"${f3}") ;;
+            esac
+        done < <(printf '%s\n' "${out}" | awk -F'\t' '$1=="H"{print "H\t" $2 "\t" $3 "\t" $4} $1=="E"{print "E\t" $2 "\t" $3 "\t" $6}')
+
+        section "Répartition de ${mp} : $(_dk_hs "${us}") utilisés sur $(_dk_hs "${fs_sz[${mp}]}") (${fs_pct[${mp}]} %)"
+        echo -e "  ${DIM}% = part de l'espace utilisé ; dossiers ≥ 2 % (min. 50 Mo), 5 plus gros par niveau, profondeur 4${N}"
+        while IFS=$'\t' read -r depth kb nfc p; do
+            pct=$(_dk_pct "${kb}" "${tot}")
+            col=""; (( pct >= 50 )) && col="${Y}"
+            if (( depth == 0 )); then name="${p}"; else name="$(printf '%*s' $(( depth * 2 )) '')${p##*/}"; fi
+            printf "  %9s ${col}%4s%%${N}  ${C}%s${N}  %s\n" "$(_dk_hs "${kb}")" "${pct}" "$(_dk_bar "${pct}" 15)" "${name}"
+        done < <(printf '%s\n' "${out}" | grep '^N' | LC_ALL=C sort -t$'\t' -k2,2 \
+                 | awk -F'\t' '{ d = $3; p = $6; pa = p; sub(/\/[^\/]*$/, "", pa); if (pa == "") pa = "/"
+                                 if (d > 0 && (!(pa in shown) || ++cnt[pa] > 5)) next
+                                 shown[p] = 1; print d "\t" $4 "\t" $5 "\t" p }')
+
+        # Origine dominante : on descend tant qu'un sous-dossier pèse ≥ 50 % de son parent
+        local -a ch=()
+        mapfile -t ch < <(printf '%s\n' "${out}" | awk -F'\t' '$1=="P"{print $2 "\t" $3}')
+        echo
+        if (( ${#ch[@]} >= 2 )); then
+            IFS=$'\t' read -r kb p <<< "${ch[-1]}"
+            pct=$(_dk_pct "${kb}" "${tot}")
+            echo -e "  ${W}Origine principale :${N} ${Y}${p}${N} — $(_dk_hs "${kb}"), soit ${pct} % de l'espace utilisé"
+            local hint; hint=$(_dk_hint "${p}"); [[ -n "${hint}" ]] && echo "  → ${hint}"
+            if (( fs_pct[${mp}] >= 80 )); then
+                _dk_find "$( (( fs_pct[${mp}] >= 90 )) && echo ERR || echo WARN)" "Origine (${mp})" "${p} : $(_dk_hs "${kb}") (${pct} % de l'utilisé). ${hint}"
+            else
+                _dk_find INFO "Plus gros poste (${mp})" "${p} : $(_dk_hs "${kb}") (${pct} % de l'utilisé)"
+            fi
+            local -a kids=()
+            mapfile -t kids < <(printf '%s\n' "${out}" | awk -F'\t' -v e="${p}" '$1=="E" && $2==e {print $3 "\t" $4 "\t" $6}' | sort -t$'\t' -k1,1nr | head -8)
+            if (( ${#kids[@]} > 0 )); then
+                echo "  Contenu de ${p} :"
+                while IFS=$'\t' read -r kb nfc f1; do
+                    printf "    %9s %4s%%  %s  ${DIM}(%s fichiers)${N}\n" "$(_dk_hs "${kb}")" "$(_dk_pct "${kb}" "${tot}")" "${f1##*/}" "${nfc}"
+                done < <(printf '%s\n' "${kids[@]}")
+            fi
+        else
+            echo "  Aucun dossier ne concentre à lui seul la moitié de l'espace : plusieurs postes, voir la répartition ci-dessus."
+        fi
+
+        echo -e "\n  ${W}Plus gros fichiers${N} (≥ 50 Mo)"
+        local nbig=0
+        while IFS=$'\t' read -r _ kb f1 p; do
+            nbig=$((nbig + 1))
+            printf "    %9s  %s  %s\n" "$(_dk_hs "${kb}")" "$(date -d "@${f1}" '+%Y-%m-%d %H:%M' 2>/dev/null)" "${p}"
+        done < <(printf '%s\n' "${out}" | awk -F'\t' '$1=="F"' | sort -t$'\t' -k2,2nr | head -10)
+        (( nbig == 0 )) && echo "    aucun"
+
+        # Ce qui a bougé depuis 24 h : réponse directe à « plein du jour au lendemain »
+        echo -e "\n  ${W}Écrit ou modifié depuis 24 h${N} : $(_dk_hs "${rtot}") dans ${rcnt} fichier(s)"
+        echo -e "  ${DIM}(taille totale des fichiers touchés : un fichier ancien qui a grossi compte pour toute sa taille)${N}"
+        mapfile -t ch < <(printf '%s\n' "${out}" | awk -F'\t' '$1=="RP"{print $2 "\t" $3}')
+        if (( ${#ch[@]} >= 2 )); then
+            IFS=$'\t' read -r kb p <<< "${ch[-1]}"
+            echo -e "  Surtout dans ${Y}${p}${N} : $(_dk_hs "${kb}") ($(_dk_pct "${kb}" "${rtot}") % de ces écritures)"
+            if (( kb >= 1048576 && kb * 20 >= fs_sz[${mp}] )); then
+                _dk_find WARN "Croissance 24 h (${mp})" "$(_dk_hs "${kb}") écrits ou modifiés dans ${p}"
+            fi
+        fi
+        while IFS=$'\t' read -r _ kb f1 p; do
+            printf "    %9s  %s  %s\n" "$(_dk_hs "${kb}")" "$(date -d "@${f1}" '+%Y-%m-%d %H:%M' 2>/dev/null)" "${p}"
+        done < <(printf '%s\n' "${out}" | awk -F'\t' '$1=="R"' | sort -t$'\t' -k2,2nr | head -5)
+
+        if [[ "${ipct}" =~ ^[0-9]+$ ]] && (( ipct >= 80 )); then
+            mapfile -t ch < <(printf '%s\n' "${out}" | awk -F'\t' '$1=="IP"{print $2 "\t" $3}')
+            IFS=$'\t' read -r kb p <<< "${ch[-1]}"
+            echo -e "\n  ${W}Inodes${N} : ${nfi} fichiers et dossiers ; le plus peuplé : ${Y}${p}${N} (${kb} entrées)"
+            _dk_find WARN "Dossier le plus peuplé (${mp})" "${p} : ${kb} fichiers (inodes ${ipct} %)"
+        fi
+
+        # Écart entre df et le parcours : fichiers ouverts supprimés ou masqués par un montage
+        d=$(timeout 5 stat -c %d "${mp}" 2>/dev/null)
+        local gap=$(( us - tot - ${del_dev[${d}]:-0} ))
+        if (( gap >= 524288 && gap * 50 >= us )); then
+            echo -e "\n  ${Y}Écart :${N} df compte $(_dk_hs "${gap}") de plus que le parcours. Recherche de fichiers masqués sous un point de montage..."
+            local hid
+            if hid=$(_dk_hidden "${mp}"); then
+                if [[ -n "${hid}" ]]; then
+                    while IFS=$'\t' read -r kb p; do
+                        echo -e "    ${R}$(_dk_hs "${kb}")${N} cachés sous ${p} (écrits quand ce montage était absent)"
+                        _dk_find ERR "Fichiers masqués (${p})" "$(_dk_hs "${kb}") sur ${mp} sous le point de montage ${p} : démonter ${p} pour les voir et les déplacer"
+                    done <<< "${hid}"
+                else
+                    echo "    rien de masqué : écart dû aux métadonnées du système de fichiers ou à des écritures en cours."
+                fi
+            else
+                echo "    vérification impossible (montage --bind refusé)."
+            fi
+        fi
+    done
+    [[ ${light} -eq 1 ]] && echo -e "\n  ${DIM}Disques sous 75 % : parcours détaillé non lancé (analyse complète : sudo jeehelp --disk).${N}"
+
+    # ── tmpfs Jeedom ──
+    for mp in "${fs_order[@]}"; do
+        [[ "${fs_t[${mp}]}" == tmpfs && "${fs_pct[${mp}]}" =~ ^[0-9]+$ ]] || continue
+        (( fs_pct[${mp}] >= 50 )) || continue
+        section "Contenu de ${mp} (tmpfs ${fs_pct[${mp}]} %, en mémoire vive)"
+        timeout 30 du -xk --max-depth=1 "${mp}" 2>/dev/null | sort -rn | sed -n '2,7p' \
+            | while IFS=$'\t' read -r kb p; do printf "    %9s  %s\n" "$(_dk_hs "${kb}")" "${p}"; done
+    done
+
+    # ── Emplacements connus ──
+    section "Emplacements connus (Jeedom et système)"
+    local -a known=(
+        "${_DK_BKP}|Sauvegardes Jeedom"
+        "${LOG_DIR}|Logs Jeedom"
+        "${JEEDOM_DIR}/plugins|Plugins (code + données)"
+        "${JEEDOM_DIR}/data|Données du core"
+        "/var/lib/mysql|Base MariaDB"
+        "/var/log|Logs système"
+        "/var/log/journal|dont journal systemd"
+        "/var/cache/apt|Cache apt"
+        "/var/lib/docker|Docker"
+        "/var/lib/containerd|containerd"
+        "/var/tmp|Temporaires persistants"
+        "/home|Dossiers utilisateurs"
+        "/root|Dossier root"
+        "/var/crash|Rapports de plantage"
+        "/var/lib/systemd/coredump|Core dumps"
+    )
+    local e lbl
+    local -A shown_p=()
+    for e in "${known[@]}"; do
+        p="${e%%|*}"; lbl="${e#*|}"
+        [[ -d "${p}" && -z "${shown_p[${p}]:-}" ]] || continue; shown_p[${p}]=1
+        kb="${hot_kb[${p}]:-}"
+        if [[ -z "${kb}" ]]; then
+            [[ ${light} -eq 1 && ( "${p}" == /var/lib/docker || "${p}" == /var/lib/containerd || "${p}" == /home ) ]] && continue
+            kb=$(timeout 120 du -sxk "${p}" 2>/dev/null | cut -f1)
+        fi
+        [[ "${kb}" =~ ^[0-9]+$ ]] && (( kb >= 1024 )) || continue
+        m=$(timeout 5 df -P "${p}" 2>/dev/null | awk 'NR==2{print $NF}')
+        pct=$(_dk_pct "${kb}" "${fs_us[${m}]:-0}")
+        col=""; (( pct >= 25 )) && col="${Y}"
+        printf "  %9s ${col}%4s%%${N}  %-26s %s\n" "$(_dk_hs "${kb}")" "${pct}" "${lbl}" "${p}"
+        if (( pct >= 30 )) && [[ "${fs_pct[${m}]:-0}" -ge 75 ]]; then
+            _dk_find WARN "${lbl}" "$(_dk_hs "${kb}") (${pct} % de ${m}) : $(_dk_hint "${p}")"
+        fi
+    done
+    echo -e "  ${DIM}% = part de l'espace utilisé du disque qui contient le dossier${N}"
+
+    local nb; nb=$(find "${_DK_BKP}" -maxdepth 1 -name '*.tar.gz' 2>/dev/null | wc -l)
+    if (( nb > 0 )); then
+        local oldest newest
+        oldest=$(find "${_DK_BKP}" -maxdepth 1 -name '*.tar.gz' -printf '%T@\n' 2>/dev/null | sort -n | head -1)
+        newest=$(find "${_DK_BKP}" -maxdepth 1 -name '*.tar.gz' -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+        echo -e "\n  ${W}Sauvegardes${N} : ${nb} archive(s) du $(date -d "@${oldest%.*}" '+%Y-%m-%d') au $(date -d "@${newest%.*}" '+%Y-%m-%d')${keep:+, rétention Jeedom ${keep} j}"
+    fi
+    if (( ${#plug_lines[@]} > 0 )); then
+        echo -e "\n  ${W}Plugins les plus lourds${N}"
+        printf '%s\n' "${plug_lines[@]}" | sort -t$'\t' -k1,1nr | head -5 \
+            | while IFS=$'\t' read -r kb p; do printf "    %9s  %s\n" "$(_dk_hs "${kb}")" "${p##*/}"; done
+    fi
+    if [[ -d "${LOG_DIR}" ]]; then
+        echo -e "\n  ${W}Plus gros logs${N}"
+        { find "${LOG_DIR}" -xdev -type f -printf '%k\t%p\n' 2>/dev/null; find /var/log -xdev -type f -printf '%k\t%p\n' 2>/dev/null; } \
+            | sort -rn | head -5 | while IFS=$'\t' read -r kb p; do printf "    %9s  %s\n" "$(_dk_hs "${kb}")" "${p}"; done
+    fi
+    local jd; jd=$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.,]+[KMGT]?B?' | head -1)
+    [[ -n "${jd}" ]] && echo -e "\n  ${W}Journal systemd${N} : ${jd} (journalctl --disk-usage)"
+    echo; _dk_mysql
+    if [[ -d /var/lib/docker ]] && (( ${hot_kb[/var/lib/docker]:-0} >= 1048576 )); then echo; _dk_docker; fi
+
+    # ── Synthèse ──
+    section "Synthèse espace disque"
+    local nerr=0 nwarn=0 it st det lvl
+    if [[ ${#_DISK_FINDINGS[@]} -eq 0 ]]; then
+        echo -e "  ${G}✔${N} Aucun problème d'espace détecté."
+    fi
+    for lvl in ERR WARN INFO; do
+        for it in "${_DISK_FINDINGS[@]}"; do
+            IFS='|' read -r st label det <<< "${it}"
+            [[ "${st}" == "${lvl}" ]] || continue
+            case "${st}" in
+                ERR)  nerr=$((nerr + 1));   echo -e "  ${R}✘${N} ${W}${label}${N} : ${det}" ;;
+                WARN) nwarn=$((nwarn + 1)); echo -e "  ${Y}⚠${N} ${W}${label}${N} : ${det}" ;;
+                *)    echo -e "  ${C}ℹ${N} ${label} : ${det}" ;;
+            esac
+        done
+    done
+    [[ "${mode}" != report ]] && echo -e "\n  ${DIM}Analyse en lecture seule : rien n'a été supprimé.${N}"
+    log_action "Analyse disque (${mode}) : ${nerr} erreur(s), ${nwarn} avertissement(s)"
+    [[ ${nerr} -gt 0 ]] && return 2
+    [[ ${nwarn} -gt 0 ]] && return 1
+    return 0
+}
+
+menu_disk() {
+    header; section "Analyse de l'espace disque"
+    echo -e "  ${DIM}Lecture seule. Parcours complet des disques concernés (basse priorité).${N}\n"
+    local out; out=$(disk_analysis interactive)
+    header
+    if command -v less &>/dev/null; then
+        printf '%s\n' "${out}" | less -RFX -P"Analyse disque (flèches/espace pour défiler, q pour quitter)"
+    else
+        printf '%s\n' "${out}"
+    fi
+    pause
 }
 
 # ============================================================
@@ -2044,6 +2915,19 @@ generate_report() {
     _r_item info "Top CPU (noms seuls)" "$(ps -eo comm,pcpu --sort=-pcpu | awk 'NR>1 && NR<=6{printf "%s %s%%  ", $1, $2}')"
     _r_item info "Top mémoire (noms seuls)" "$(ps -eo comm,pmem --sort=-pmem | awk 'NR>1 && NR<=6{printf "%s %s%%  ", $1, $2}')"
 
+    # ── Espace disque : parcours complet seulement si un disque dépasse 75 % ──
+    _r_sec "Espace disque (analyse)"
+    local dk_st dk_lab dk_det dk_it
+    disk_analysis report > "${_R_BODY}.disk" 2>/dev/null
+    for dk_it in "${_DISK_FINDINGS[@]}"; do
+        IFS='|' read -r dk_st dk_lab dk_det <<< "${dk_it}"
+        # % disque et inodes : déjà notés ci-dessus (Ressources système)
+        [[ "${dk_lab}" == "Disque "* || "${dk_lab}" == "Inodes "* ]] && continue
+        case "${dk_st}" in ERR) _r_item err "${dk_lab}" "${dk_det}" ;; WARN) _r_item warn "${dk_lab}" "${dk_det}" ;; esac
+    done
+    sed -e '/^── Synthèse espace disque/,$d' -e 's/^/        /' "${_R_BODY}.disk" >> "${_R_BODY}"
+    rm -f "${_R_BODY}.disk"
+
     # ── Services ──
     _r_sec "Services"
     local svc s_st
@@ -2135,6 +3019,8 @@ generate_report() {
     local nup; nup=$(apt list --upgradable 2>/dev/null | grep -c upgradable)
     [[ "${nup}" -gt 20 ]] && _r_item warn "Paquets à mettre à jour" "${nup}" || _r_item ok "Paquets à mettre à jour" "${nup}"
     [[ -f /var/run/reboot-required ]] && _r_item warn "Redémarrage requis" "oui (mise à jour noyau/libc)" || _r_item ok "Redémarrage requis" "non"
+    local stale; stale=$(_stale_summary full)
+    [[ -n "${stale}" ]] && _r_item warn "Processus sur d'anciennes bibliothèques" "${stale}" || _r_item ok "Processus sur d'anciennes bibliothèques" "aucun"
 
     # ── Actions récentes de jeehelp ──
     _r_sec "Actions récentes de jeehelp (audit et mode secours)"
@@ -2238,11 +3124,13 @@ declare -g _R_FINAL=""
 declare -gA AI_ACTIONS=(
     [check]="--check|lecture|Vérification rapide (cron, disque, SSL)"
     [health]="--health|lecture|Contrôle de santé complet"
+    [disk]="--disk|lecture|Analyse détaillée de l'espace disque (origine, tailles, %)"
     [report]="--report|lecture|Régénérer le rapport de diagnostic"
     [fix-perms]="--fix-perms|modification|Rétablir les droits fichiers (comme le bouton Jeedom)"
     [repair-db]="--repair-db|modification|REPAIR TABLE sur toutes les tables"
     [backup]="--backup|modification|Lancer une sauvegarde Jeedom"
     [upgrade-security]="--upgrade-security|modification|Appliquer les mises à jour de sécurité Debian"
+    [restart-check]="--restart-check|lecture|Lister les services et démons restés sur d'anciennes bibliothèques"
 )
 
 _ai_conf_get() {
@@ -2747,6 +3635,9 @@ cli_mode() {
             _watchdog_check; local wd_rc=$?
             _ssl_check_auto; local ssl_rc=$?
             [[ ${wd_rc} -ne 0 || ${ssl_rc} -ne 0 ]] && rc=1 ;;
+        --disk)
+            disk_analysis cli
+            rc=$? ;;
         --health)
             echo "[CLI] Health check complet..."
             show_health "cli"
@@ -2766,18 +3657,29 @@ cli_mode() {
             echo "[CLI] unattended-upgrade..."
             _upgrade_security cli
             rc=$? ;;
+        --restart-check)
+            _stale_check cli
+            rc=$? ;;
+        --apt-hook)  # appelé par dpkg (voir _apt_hook_setup), pas à la main
+            _apt_hook "${2:-log}"
+            exit 0 ;;
+        --apt-hook-run)  # lancé par le timer systemd posé par --apt-hook
+            _apt_hook_run "${2:-log}"
+            rc=$? ;;
         *)
             echo "Usage: sudo bash $0 [option]"
             echo "  --backup            Lancer une sauvegarde"
             echo "  --repair-db         Réparer la base de données"
             echo "  --check             Vérification rapide (code retour : 0 OK, 1 anomalie)"
             echo "  --health            Health check complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
+            echo "  --disk              Analyse de l'espace disque : origine, tailles et % par dossier (lecture seule)"
             echo "  --report            Rapport de diagnostic complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --ask [options]     Analyse du rapport par IA (local d'abord) : --pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run --include-invalid"
             echo "  --download [N]               Liste les sauvegardes, ou envoie la N-ième (1 = dernière) sur stdout : ssh box "sudo jeehelp --download 1" > f.tar.gz"
             echo "  --self-update       Mettre jeehelp à jour depuis GitHub (--branch NOM, --yes)"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
+            echo "  --restart-check     Services et démons restés sur d'anciennes bibliothèques (code retour : 0 aucun, 1 à relancer)"
             exit 1 ;;
     esac
     exit $rc
