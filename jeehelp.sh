@@ -1,15 +1,14 @@
 #!/bin/bash
 # ============================================================
-#  jeedom-menu.sh v3 — Menu d'administration Jeedom
-#  Navigation : ↑↓ sélection  ENTRÉE valider  ÉCHAP retour  CTRL+C quitter
-#  Debian 11/12, Jeedom >= 4.4
-#  Interactif : sudo bash jeedom-menu.sh
-#  CLI        : sudo bash jeedom-menu.sh --backup
-#               sudo bash jeedom-menu.sh --repair-db
-#               sudo bash jeedom-menu.sh --check
-#               sudo bash jeedom-menu.sh --disk
-#               sudo bash jeedom-menu.sh --upgrade-security
-#               sudo bash jeedom-menu.sh --restart-check
+#  jeehelp — Menu d'administration Jeedom (installé en /usr/local/bin/jeehelp)
+#  Navigation : ↑↓ ou numéro  ENTRÉE valider  ÉCHAP retour  CTRL+C quitter
+#  Debian 11 à 13, Jeedom >= 4.4
+#  Interactif : sudo jeehelp
+#  CLI        : sudo jeehelp --backup | --repair-db | --check | --health | --disk
+#                            --report | --ask [options] | --download [N]
+#                            --self-update [--branch NOM] [--yes] | --fix-perms
+#                            --upgrade-security | --restart-check
+#  Internes   : --apt-hook MODE, --apt-hook-run MODE (appelés par le hook apt)
 # ============================================================
 
 # ── Constantes ───────────────────────────────────────────────
@@ -146,26 +145,60 @@ read_key() {
 #  nav_menu "Titre du menu" label1 label2 ... labelN
 #  Le dernier label doit être l'item "retour/quitter".
 #  Résultat dans $MENU_RESULT (0-based) ; -1 si ESC.
+#
+#  Chaque entrée porte un numéro : taper ce numéro place la sélection dessus,
+#  Entrée l'ouvre (jamais d'ouverture sur le seul chiffre : certaines actions
+#  sont sensibles). La dernière entrée prend le 0 si c'est une sortie
+#  (« ↩ Retour/Annuler », « ❌ Quitter »), les autres sont numérotées 1..N.
+#  Les chiffres s'accumulent (1 puis 3 = 13) tant que le nombre existe ;
+#  sinon seul le dernier chiffre est gardé. Retour arrière efface, une
+#  flèche annule la saisie.
+
+#  Numéro de l'entrée $1 (0-based), selon $2 = index de la sortie (-1 si aucune).
+_nav_num() { [[ $1 -eq $2 ]] && echo 0 || echo $(( $1 + 1 )); }
+
+#  Index de l'entrée portant le numéro $1, ou rien s'il n'existe pas.
+#  $2 = nombre d'entrées, $3 = index de la sortie (-1 si aucune).
+_nav_index() {
+    local n="$1" total="$2" exit_idx="$3" last
+    [[ "${n}" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    n=$((10#${n}))
+    if [[ ${n} -eq 0 ]]; then
+        [[ ${exit_idx} -ge 0 ]] && echo "${exit_idx}" && return 0
+        return 1
+    fi
+    last=${total}; [[ ${exit_idx} -ge 0 ]] && last=$((total - 1))
+    [[ ${n} -le ${last} ]] && echo $((n - 1))
+}
 
 _draw_nav_menu() {
-    local title="$1" sel="$2"
-    shift 2
+    local title="$1" sel="$2" buf="$3" exit_idx="$4"
+    shift 4
     local -a opts=("$@")
-    local total=${#opts[@]}
+    local total=${#opts[@]} width num i
+    width=$(( exit_idx >= 0 ? total - 1 : total )); width=${#width}
 
     header
     section "$title"
 
     for i in "${!opts[@]}"; do
+        printf -v num '%*s' "${width}" "$(_nav_num "$i" "${exit_idx}")"
         if [[ $i -eq $sel ]]; then
-            echo -e "  ${C}▶${N} ${W}${opts[$i]}${N}"
+            echo -e "  ${C}▶${N} ${C}${num}.${N} ${W}${opts[$i]}${N}"
         else
-            echo -e "  ${DIM}  ${opts[$i]}${N}"
+            echo -e "  ${DIM}  ${num}. ${opts[$i]}${N}"
         fi
     done
 
     echo
-    echo -e "  ${DIM}↑↓ naviguer  ↵ sélectionner  Échap retour  Ctrl+C quitter${N}"
+    echo -e "  ${DIM}↑↓ ou numéro : choisir  ↵ ouvrir  Échap retour  Ctrl+C quitter${N}"
+    if [[ -n "${buf}" ]]; then
+        if _nav_index "${buf}" "${total}" "${exit_idx}" >/dev/null; then
+            echo -e "  ${W}Choix : ${buf}${N}"
+        else
+            echo -e "  ${Y}Choix : ${buf} : ce numéro n'existe pas${N}"
+        fi
+    fi
 }
 
 nav_menu() {
@@ -173,12 +206,14 @@ nav_menu() {
     shift
     local -a opts=("$@")
     local total=${#opts[@]}
-    local sel=0
+    local sel=0 buf="" exit_idx=-1 idx
+
+    [[ "${opts[$((total - 1))]}" =~ ^(↩|❌) ]] && exit_idx=$((total - 1))
 
     _cursor_hide
 
     while true; do
-        _draw_nav_menu "$title" "$sel" "${opts[@]}"
+        _draw_nav_menu "$title" "$sel" "$buf" "$exit_idx" "${opts[@]}"
         read_key
 
         case "$KEY_RESULT" in
@@ -186,14 +221,33 @@ nav_menu() {
                 # Affectation arithmétique (jamais un post-/pré-incrément ((…))) :
                 # ((sel++)) renvoie la valeur AVANT incrément comme statut de sortie,
                 # donc un sel=0 fait échouer le && et déclenche aussi le || qui suit.
+                buf=""
                 [[ $sel -gt 0 ]] && sel=$((sel - 1)) || sel=$((total - 1))
                 ;;
             down)
+                buf=""
                 [[ $sel -lt $((total - 1)) ]] && sel=$((sel + 1)) || sel=0
                 ;;
-            pgup) sel=0 ;;
-            pgdn) sel=$((total - 1)) ;;
+            pgup) buf=""; sel=0 ;;
+            pgdn) buf=""; sel=$((total - 1)) ;;
+            [0-9])
+                if idx=$(_nav_index "${buf}${KEY_RESULT}" "$total" "$exit_idx"); then
+                    buf="${buf}${KEY_RESULT}"
+                elif idx=$(_nav_index "${KEY_RESULT}" "$total" "$exit_idx"); then
+                    buf="${KEY_RESULT}"
+                else
+                    # Gardé à l'écran comme invalide : Entrée est alors refusée,
+                    # au lieu d'ouvrir l'entrée surlignée sans prévenir.
+                    buf="${KEY_RESULT}"; idx=""
+                fi
+                [[ -n "${idx}" ]] && sel=${idx}
+                ;;
+            $'\x7f'|$'\b')  # Retour arrière
+                buf="${buf%?}"
+                [[ -n "${buf}" ]] && idx=$(_nav_index "${buf}" "$total" "$exit_idx") && sel=${idx}
+                ;;
             enter)
+                [[ -n "${buf}" ]] && ! _nav_index "${buf}" "$total" "$exit_idx" >/dev/null && continue
                 _cursor_show
                 MENU_RESULT=$sel
                 return
@@ -473,7 +527,7 @@ _ssl_check_auto() {
 # ============================================================
 
 # ── Indicateur visuel générique ──────────────────────────────
-declare -g _H_OK=0 _H_WARN=0 _H_ERR=0
+declare -g _H_OK=0 _H_WARN=0 _H_ERR=0 _H_PERM=0
 
 _chk() {
     local label="$1" status="$2" msg="$3"
@@ -482,6 +536,9 @@ _chk() {
         warn) printf "  ${Y}⚠${N}  %-28s %s\n" "${label}" "${msg}"; _H_WARN=$((_H_WARN + 1)) ;;
         err)  printf "  ${R}✘${N}  %-28s %s\n" "${label}" "${msg}"; _H_ERR=$((_H_ERR + 1)) ;;
     esac
+    # Contrôles de droits en échec : seuls à justifier le conseil final.
+    [[ "${status}" != ok && "${label}" =~ ^(Permissions|Droits) ]] && _H_PERM=$((_H_PERM + 1))
+    return 0
 }
 
 # Identité matérielle : device-tree (ARM/SBC — Smart/Atlas) sinon DMI (x86-64).
@@ -511,14 +568,16 @@ show_health() {
     local mode="${1:-interactive}"
     [[ "$mode" == "interactive" ]] && header
     section "Vérification générale"
-    _H_OK=0; _H_WARN=0; _H_ERR=0
+    _H_OK=0; _H_WARN=0; _H_ERR=0; _H_PERM=0
 
     # ── Matériel ──
     local hw_model; hw_model=$(_hw_model)
     if [[ -z "${hw_model}" ]]; then
         _chk "Matériel" ok "indéterminé"
     elif [[ "${hw_model}" =~ [Rr]ock[[:space:]]?[Pp]i|[Rr]adxa ]]; then
-        _chk "Matériel" warn "${hw_model} — box officielle Jeedom (Atlas) : après une mise à jour noyau, MAC/IP peuvent changer"
+        # Information, pas une anomalie : un « warn » permanent fausserait le
+        # code retour de --health sur toutes les box Atlas.
+        _chk "Matériel" ok "${hw_model} — box officielle Jeedom (Atlas) : après une mise à jour noyau, MAC/IP peuvent changer"
     else
         _chk "Matériel" ok "${hw_model}"
     fi
@@ -685,10 +744,11 @@ show_health() {
     # droits incorrects. PHP ne peut plus écrire ses logs (fwrite() sur un
     # stream invalide) → erreur fatale sur chaque page, y compris la page
     # rescue. Cas réel confirmé par l'équipe Jeedom, résolu par chown/chmod
-    # (cf. « Rétablissement des droits »).
+    # (cf. « Rétablissement des droits »). Seule la fin récente du log compte :
+    # une ancienne ligne resterait sinon en erreur après la correction.
     if [[ -f "${LOG_DIR}/http.error" ]] \
-        && grep -q 'fwrite(): Argument #1 (\$stream) must be of type resource' "${LOG_DIR}/http.error" 2>/dev/null; then
-        _chk "Droits (log PHP)" err "erreur fatale d'écriture détectée (fwrite/stream) : lancez « Rétablissement des droits »"
+        && tail -n 500 "${LOG_DIR}/http.error" 2>/dev/null | grep -q 'fwrite(): Argument #1 (\$stream) must be of type resource'; then
+        _chk "Droits (log PHP)" err "erreur fatale d'écriture détectée (fwrite/stream) : lancez Maintenance › Rétablir les droits"
     else
         _chk "Droits (log PHP)" ok "aucune erreur fatale d'écriture détectée"
     fi
@@ -740,10 +800,9 @@ show_health() {
     printf "  ${G}✔ %-3s OK${N}   ${Y}⚠ %-3s avertissement(s)${N}   ${R}✘ %-3s erreur(s)${N}\n" \
         "$_H_OK" "$_H_WARN" "$_H_ERR"
 
-    if [[ $_H_ERR -gt 0 || $_H_WARN -gt 0 ]]; then
+    if [[ $_H_PERM -gt 0 ]]; then
         echo
-        echo -e "  ${Y}→  Pensez à utiliser « Rétablissement des droits »${N}"
-        echo -e "     ${Y}si des erreurs de permissions sont signalées.${N}"
+        echo -e "  ${Y}→  Droits incorrects signalés : utilisez Maintenance › Rétablir les droits.${N}"
     fi
     [[ "$mode" == "interactive" ]] && pause
     [[ $_H_ERR -gt 0 ]] && return 2
@@ -891,27 +950,107 @@ _show_users() {
 }
 
 # Sous-menu santé
-menu_health() {
+
+# ============================================================
+#  MENUS DIAGNOSTIC & MAINTENANCE (regroupent des actions définies ailleurs)
+# ============================================================
+
+menu_diagnostic() {
     local opts=(
-        "🔍  Vérification générale (health check)"
-        "🔑  Rétablissement des droits fichiers/dossiers"
-        "👤  Lister les utilisateurs"
+        "📊  Informations système & watchdog"
+        "🏥  Contrôle de santé complet"
+        "💿  Analyse de l'espace disque"
+        "📝  Générer un rapport de diagnostic"
+        "🤖  Analyser le rapport avec l'IA"
         "↩  Retour"
     )
     while true; do
-        nav_menu "Santé & Droits" "${opts[@]}"
+        nav_menu "Diagnostic" "${opts[@]}"
         case $MENU_RESULT in
-            -1|3) return ;;
-            0) show_health      ;;
-            1) fix_permissions  ;;
-            2) _show_users      ;;
+            -1|5) return ;;
+            0) show_system_info ;;
+            1) show_health      ;;
+            2) menu_disk        ;;
+            3) menu_report      ;;
+            4) menu_ask         ;;
         esac
     done
+}
+
+menu_maintenance() {
+    local opts=(
+        "🧰  Maintenance générale (droits + base + cache, enchaînés)"
+        "🔑  Rétablir les droits fichiers/dossiers"
+        "🧹  Vider le cache Jeedom"
+        "⚡  Vider l'OPcache PHP"
+        "🗑️   Nettoyer /tmp"
+        "↩  Retour"
+    )
+    while true; do
+        nav_menu "Maintenance" "${opts[@]}"
+        case $MENU_RESULT in
+            -1|5) return ;;
+            0) maintenance_generale ;;
+            1) fix_permissions      ;;
+            2) _db_flush_cache      ;;
+            3) _opcache_reset ;;
+            4) _cleanup_tmp ;;
+        esac
+    done
+}
+
+#  Vide l'OPcache du PHP servi par le web. Un « php -r opcache_reset() » ne
+#  vide que le cache du PHP en ligne de commande (propre à ce processus), pas
+#  celui d'Apache ou de PHP-FPM, seul utilisé par Jeedom. Un rechargement en
+#  douceur (systemctl reload) réinitialise ce cache sans couper les requêtes
+#  en cours : vérifié avec mod_php (date de démarrage du cache renouvelée).
+_opcache_reset() {
+    header; section "Vider l'OPcache PHP (serveur web)"
+    local done=0 u
+    if systemctl is-active --quiet apache2 && compgen -G "/etc/apache2/mods-enabled/php*.load" >/dev/null; then
+        if ! apache2ctl configtest >/dev/null 2>&1; then
+            echo -e "${R}✘ Configuration Apache invalide (apache2ctl configtest) : rechargement annulé.${N}"
+        elif systemctl reload apache2; then
+            echo -e "${G}✔${N} Apache (mod_php) rechargé : OPcache vidé."; done=1
+        else
+            echo -e "${R}✘${N} Échec du rechargement d'Apache."
+        fi
+    fi
+    for u in $(systemctl list-units --type=service --state=active --no-legend --plain 'php*-fpm.service' 2>/dev/null | awk '{print $1}'); do
+        if systemctl reload "${u}"; then
+            echo -e "${G}✔${N} ${u} rechargé : OPcache vidé."; done=1
+        else
+            echo -e "${R}✘${N} Échec du rechargement de ${u}."
+        fi
+    done
+    if [[ ${done} -eq 1 ]]; then
+        echo -e "${DIM}Rechargement en douceur : aucune requête en cours n'est coupée.${N}"
+        log_action "OPcache vidé (rechargement du PHP web)"
+    else
+        echo -e "${Y}Aucun PHP servi par le web n'a été rechargé (ni Apache avec mod_php, ni PHP-FPM actif).${N}"
+    fi
+    pause
 }
 
 # ============================================================
 #  2 — SAUVEGARDES
 # ============================================================
+
+_backup_purge_old() {
+    header; section "Sauvegardes de plus de ${MAX_BACKUPS} jours"
+    local found; found=$(find "${BACKUP_DIR}" -name "*.tar.gz" -mtime +${MAX_BACKUPS} 2>/dev/null)
+    if [[ -z "$found" ]]; then
+        echo -e "${G}Rien à supprimer.${N}"
+    else
+        echo "${found}"
+        echo
+        confirm "Supprimer ces fichiers" \
+            && { find "${BACKUP_DIR}" -name "*.tar.gz" -mtime +${MAX_BACKUPS} -delete
+                 echo -e "${G}✔ Supprimés.${N}"; log_action "Old backups purged"; } \
+            || echo -e "${Y}Annulé.${N}"
+    fi
+    pause
+}
 
 menu_backups() {
     local opts=(
@@ -919,18 +1058,20 @@ menu_backups() {
         "➕  Créer une sauvegarde"
         "📤  Restaurer une sauvegarde"
         "🗑️   Supprimer une sauvegarde"
-        "🔄  Rotation (garder ${MAX_BACKUPS} dernières)"
+        "🔄  Rotation : garder les ${MAX_BACKUPS} dernières"
+        "🧽  Purger les sauvegardes de plus de ${MAX_BACKUPS} jours"
         "↩  Retour"
     )
     while true; do
         nav_menu "Sauvegardes" "${opts[@]}"
         case $MENU_RESULT in
-            -1|5) return ;;
+            -1|6) return ;;
             0) _backup_list    ;;
             1) _backup_create  ;;
             2) _backup_restore ;;
             3) _backup_delete  ;;
             4) _backup_rotate  ;;
+            5) _backup_purge_old ;;
         esac
     done
 }
@@ -1021,16 +1162,15 @@ menu_database() {
         "🔧  Réparer    (REPAIR TABLE)"
         "⚡  Optimiser  (OPTIMIZE TABLE)"
         "📏  Taille des tables"
-        "🔍  mysqlcheck complet (--auto-repair)"
+        "🔍  Vérifier et réparer les tables (CHECK/REPAIR)"
         "💾  Dump SQL complet"
         "📥  Importer un dump"
-        "🧹  Vider le cache Jeedom"
         "↩  Retour"
     )
     while true; do
         nav_menu "Base de données" "${opts[@]}"
         case $MENU_RESULT in
-            -1|8) return ;;
+            -1|7) return ;;
             0) _db_all_tables "ANALYZE"   ;;
             1) _db_all_tables "REPAIR"    ;;
             2) _db_all_tables "OPTIMIZE"  ;;
@@ -1038,7 +1178,6 @@ menu_database() {
             4) _db_mysqlcheck             ;;
             5) _db_dump                   ;;
             6) _db_import                 ;;
-            7) _db_flush_cache            ;;
         esac
     done
 }
@@ -1138,7 +1277,12 @@ _db_check_and_repair() {
     local failed=0 tbl tbl_escaped check_out last_msg repair_out rstatus
     for tbl in "${tables[@]}"; do
         tbl_escaped="${tbl//\`/\`\`}"
-        check_out=$(mysql_cmd -N -e "CHECK TABLE \`${tbl_escaped}\`;")
+        # Échec de mysql (base arrêtée, connexion perdue) ou réponse vide :
+        # jamais compté comme « OK ».
+        if ! check_out=$(mysql_cmd -N -e "CHECK TABLE \`${tbl_escaped}\`;") || [[ -z "${check_out}" ]]; then
+            printf "  %-35s %s\n" "${tbl}" "CHECK impossible (MariaDB injoignable ?)"
+            failed=1; continue
+        fi
         last_msg=$(awk -F'\t' '{print $4}' <<< "${check_out}" | tail -1)
         # Seul Msg_type="error" est une vraie anomalie. Un "note" (ex: moteur
         # MEMORY — "doesn't support check") est normal et ne doit PAS déclencher
@@ -1159,7 +1303,7 @@ _db_check_and_repair() {
         echo -e "\n${G}✔ Terminé.${N}"
         log_action "DB check/repair"
     else
-        echo -e "\n${Y}⚠ Terminé avec au moins une table en anomalie après réparation.${N}"
+        echo -e "\n${Y}⚠ Terminé avec au moins une table en anomalie ou non vérifiée.${N}"
         log_action "DB check/repair (anomalies détectées)"
     fi
     [[ "$mode" == "interactive" ]] && pause
@@ -1253,20 +1397,27 @@ menu_services() {
         "📡  État des services"
         "🌐  Redémarrer Apache / Nginx"
         "🗄️   Redémarrer MariaDB"
-        "⚙️   Redémarrer daemon Jeedom (cron)"
+        "⚙️   Redémarrer le moteur cron de Jeedom"
         "🔄  Relancer Jeedom complet"
-        "💻  Reboot serveur"
+        "👤  Utilisateurs Jeedom"
+        "💻  Redémarrer le serveur (reboot)"
         "↩  Retour"
     )
     while true; do
         nav_menu "Services & Jeedom" "${opts[@]}"
         case $MENU_RESULT in
-            -1|6) return ;;
+            -1|7) return ;;
             0) _svc_status ;;
             1) header; section "Redémarrage Apache/Nginx"
-               for s in apache2 nginx; do svc_ctl restart "$s"; done; pause ;;
+               if confirm "Redémarrer le serveur web (interface Jeedom coupée quelques secondes)"; then
+                   for s in apache2 nginx; do svc_ctl restart "$s"; done
+               else echo -e "${Y}Annulé.${N}"; fi
+               pause ;;
             2) header; section "Redémarrage MariaDB"
-               for s in mysql mariadb; do svc_ctl restart "$s"; done; pause ;;
+               if confirm "Redémarrer MariaDB (Jeedom privé de base pendant le redémarrage)"; then
+                   for s in mysql mariadb; do svc_ctl restart "$s"; done
+               else echo -e "${Y}Annulé.${N}"; fi
+               pause ;;
             3) _svc_restart_daemon ;;
             4) header
                confirm "Relancer Jeedom complet" \
@@ -1274,7 +1425,8 @@ menu_services() {
                         log_action "Jeedom restart (stop+start)"; echo -e "${G}✔${N}"; } \
                    || echo -e "${Y}Annulé.${N}"
                pause ;;
-            5) _server_reboot ;;
+            5) _show_users    ;;
+            6) _server_reboot ;;
         esac
     done
 }
@@ -1341,7 +1493,7 @@ menu_logs() {
         "👁️   Afficher un log (50 lignes)"
         "📡  Suivre un log en temps réel (tail -f)"
         "🗑️   Vider tous les logs"
-        "🔧  Journalctl système"
+        "🔧  Journal système (journalctl)"
         "📒  Journal des actions (audit)"
         "↩  Retour"
     )
@@ -1436,15 +1588,15 @@ menu_network() {
 
 menu_updates() {
     local opts=(
-        "🔍  Vérifier mises à jour Jeedom"
+        "🔍  Vérifier les mises à jour Jeedom"
         "⬆️   Mettre à jour Jeedom (core)"
-        "📦  apt update + upgrade"
-        "🔒  Configurer unattended-upgrades"
-        "🧪  Simuler les mises à jour de sécurité (sans rien appliquer)"
-        "📊  Statut unattended-upgrades"
+        "📦  Mettre à jour le système (apt update + upgrade)"
         "🛡️   Appliquer les mises à jour de sécurité maintenant"
         "♻️   Processus à relancer après mise à jour"
+        "🧽  Supprimer les paquets inutiles (apt autoremove)"
+        "🔒  Mises à jour de sécurité automatiques (unattended-upgrades)"
         "🔔  Vérification automatique après mise à jour (hook apt)"
+        "⬆️   Mettre à jour jeehelp (GitHub)"
         "↩  Retour"
     )
     while true; do
@@ -1475,6 +1627,8 @@ menu_updates() {
                    || echo -e "${Y}Annulé.${N}"
                pause ;;
             2) header; section "apt update + upgrade"
+               confirm "Mettre à jour tous les paquets du système (apt upgrade)" \
+                   || { echo -e "${Y}Annulé.${N}"; pause; continue; }
                # pipefail scopé : sans lui, le `| tail -5` masquerait le code
                # retour réel d'apt-get update (celui de `tail`, toujours 0).
                if (set -o pipefail; apt-get update 2>&1 | tail -5) && apt-get upgrade -y 2>&1; then
@@ -1485,12 +1639,42 @@ menu_updates() {
                fi
                echo; _stale_check interactive
                pause ;;
-            3) _unattended_setup  ;;
-            4) _unattended_dryrun ;;
-            5) _unattended_status ;;
-            6) _upgrade_security interactive ;;
-            7) header; _stale_check interactive; pause ;;
-            8) _apt_hook_setup ;;
+            3) _upgrade_security interactive ;;
+            4) header; _stale_check interactive; pause ;;
+            5) header; section "Paquets inutiles (apt autoremove)"
+               # Aperçu d'abord : autoremove peut retirer un paquet « auto »
+               # dont un plugin dépend encore.
+               local rm_list; rm_list=$(apt-get -s autoremove 2>/dev/null | awk '/^Remv /{print "  " $2}')
+               if [[ -z "${rm_list}" ]]; then
+                   echo -e "${G}Aucun paquet à supprimer.${N}"
+               else
+                   echo -e "Paquets qui seraient supprimés :\n${rm_list}\n"
+                   if confirm "Supprimer ces $(grep -c . <<< "${rm_list}") paquet(s)"; then
+                       apt-get autoremove -y 2>&1; log_action "apt autoremove"
+                   else echo -e "${Y}Annulé.${N}"; fi
+               fi
+               pause ;;
+            6) _unattended_menu ;;
+            7) _apt_hook_setup ;;
+            8) menu_self_update ;;
+        esac
+    done
+}
+
+_unattended_menu() {
+    local opts=(
+        "🔒  Installer et configurer"
+        "🧪  Simuler (sans rien appliquer)"
+        "📊  Statut et dernier journal"
+        "↩  Retour"
+    )
+    while true; do
+        nav_menu "Mises à jour de sécurité automatiques (unattended-upgrades)" "${opts[@]}"
+        case $MENU_RESULT in
+            -1|3) return ;;
+            0) _unattended_setup  ;;
+            1) _unattended_dryrun ;;
+            2) _unattended_status ;;
         esac
     done
 }
@@ -1633,24 +1817,40 @@ _upgrade_security() {
 #    systemd|1        PID 1 : systemctl daemon-reexec ou reboot
 #    process|<nom>    autre processus sans service propre
 #  Les sessions utilisateur (user.slice) sont ignorées : se reconnecter suffit.
+#  Services relancés seulement un par un, chacun sur confirmation : leur
+#  relance coupe Jeedom (base) ou des conteneurs.
+readonly _STALE_ONE_BY_ONE='^(mariadb|mysql|docker|containerd)\.service$'
 readonly _STALE_SENSITIVE='^(dbus|systemd-logind|NetworkManager|networking|systemd-networkd|wpa_supplicant|lightdm|gdm3?|sddm|display-manager|(serial-)?getty@.*|user@.*)\.service$'
 
+#  /proc/<pid>/comm et cmdline sont choisis librement par le processus
+#  (www-data, démon de plugin, conteneur) : jamais affichés ni réutilisés tels
+#  quels en root. comm est filtré (pas de saut de ligne ni de séquence
+#  terminal), un id de plugin n'est retenu que si son dossier existe, un nom
+#  d'unité que s'il a la forme d'une unité systemd.
 _stale_scan() {
-    local m pid cg unit cmd
+    local m pid cg unit cmd comm
     local -A main=() km=()
     for m in /proc/[0-9]*/maps; do
-        grep -qE ' /(usr/)?(lib|lib64|bin|sbin|libexec)/[^ ]* \(deleted\)$' "$m" 2>/dev/null || continue
+        # Bibliothèques (.so) et exécutables seulement : un fichier de données
+        # remplacé sous /usr/lib (locale-archive...) ne justifie pas de relance.
+        grep -qE ' /(usr/)?(lib|lib64)/[^ ]*\.so[^ /]* \(deleted\)$| /(usr/)?(bin|sbin|libexec)/[^ ]* \(deleted\)$' "$m" 2>/dev/null || continue
         pid=${m#/proc/}; pid=${pid%/maps}
-        [[ "${pid}" == 1 ]] && { echo "systemd|1"; continue; }
-        cg=$(grep -m1 '^0::' "/proc/${pid}/cgroup" 2>/dev/null); cg=${cg#0::}
+        if [[ "${pid}" == 1 ]]; then
+            # Dans un conteneur, le PID 1 n'est pas systemd : rien à proposer.
+            [[ "$(cat /proc/1/comm 2>/dev/null)" == systemd ]] && echo "systemd|1"
+            continue
+        fi
+        # cgroup v2 (ligne 0::) ; repli cgroup v1 pur sur la hiérarchie name=systemd.
+        cg=$(grep -m1 -E '^0::/.|^[0-9]+:name=systemd:' "/proc/${pid}/cgroup" 2>/dev/null); cg=${cg#*:*:}
         [[ "${cg}" == /user.slice/* ]] && continue
         cmd=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
         # Tâches du core relancées chaque minute (jeeCron...) : se renouvellent seules.
         [[ "${cmd}" == *"${JEEDOM_DIR}/core/php/"* ]] && continue
-        if [[ "${cmd}" =~ ${JEEDOM_DIR}/plugins/([A-Za-z0-9_]+)/ ]]; then
+        if [[ "${cmd}" =~ ${JEEDOM_DIR}/plugins/([A-Za-z0-9_]+)/ && -d "${JEEDOM_DIR}/plugins/${BASH_REMATCH[1]}" ]]; then
             echo "plugin|${BASH_REMATCH[1]}"; continue
         fi
         unit=$(grep -oE '[^/]+\.service' <<< "${cg}" | head -1)
+        [[ "${unit}" =~ ^[A-Za-z0-9@._:\\-]+\.service$ ]] || unit=""
         if [[ "${cg}" == /system.slice/* && -n "${unit}" ]]; then
             if [[ -z "${km[${unit}]+x}" ]]; then
                 km[${unit}]=$(systemctl show -p KillMode --value "${unit}" 2>/dev/null)
@@ -1663,20 +1863,40 @@ _stale_scan() {
                 continue
             fi
         fi
-        echo "process|$(cat "/proc/${pid}/comm" 2>/dev/null) (pid ${pid})"
+        comm=$(head -c 32 "/proc/${pid}/comm" 2>/dev/null | tr -d '\n' | tr -c '[:alnum:]._@:+-' '?')
+        echo "process|${comm:-?} (pid ${pid})"
     done | sort -u
 }
 
 #  Relance le démon d'un plugin par Jeedom (deamon_start forcé). Affiche
-#  l'état obtenu ou l'erreur ; code retour 0 si relancé.
+#  l'état obtenu ou la raison de l'échec ; code retour 0 seulement si le démon
+#  tourne (état ok) à la fin.
+#  - deamon_start(true) arrête d'abord le démon puis avale ses propres
+#    exceptions (protection des 45 s, plugin non lançable) : sans les
+#    vérifications préalables, un démon laissé ARRÊTÉ passait pour relancé.
+#  - Lancé dans un scope systemd à part sous system.slice : sinon le démon
+#    hérite du cgroup de l'appelant, soit l'unité transitoire du hook apt (tuée
+#    avec tout son cgroup quand le hook se termine), soit la session SSH de
+#    l'admin (sudo n'en sort pas), qu'il suivrait et que _stale_scan ignore.
+readonly _STALE_RESTART_PHP='
+    try {
+        $p = plugin::byId(getenv("JH_PLUGIN"));
+        if ($p->getHasOwnDeamon() != 1) { echo "pas de démon géré par Jeedom"; exit(1); }
+        $i = $p->deamon_info();
+        if (($i["launchable"] ?? "") != "ok") { echo "non relançable : " . ($i["launchable_message"] ?? "?"); exit(1); }
+        $c = cache::byKey("deamonStart" . $p->getId() . "inprogress")->getValue(array());
+        if (isset($c["datetime"]) && abs(time() - $c["datetime"]) < 45) { echo "lancé il y a moins de 45 s par Jeedom, à réessayer plus tard"; exit(1); }
+        $p->deamon_start(true);
+        for ($t = 0; $t < 30 && $p->deamon_info()["state"] != "ok"; $t++) sleep(1);
+        $s = $p->deamon_info()["state"];
+        echo "état : " . $s;
+        exit($s == "ok" ? 0 : 1);
+    } catch (Throwable $e) { echo $e->getMessage(); exit(1); }'
+
 _stale_restart_plugin() {
-    _jee_php_env "JH_PLUGIN=$1" '
-        try {
-            $p = plugin::byId(getenv("JH_PLUGIN"));
-            if ($p->getHasOwnDeamon() != 1) { echo "pas de démon géré par Jeedom"; exit(1); }
-            $p->deamon_start(true);
-            echo "état : " . $p->deamon_info()["state"];
-        } catch (Throwable $e) { echo $e->getMessage(); exit(1); }'
+    systemd-run --scope --quiet --collect --slice=system.slice \
+        --unit="jeehelp-plugin-$1-$(date +%s%N)" -- \
+        sudo -u www-data env "JH_PLUGIN=$1" php -r "require '${CORE_INC}'; ${_STALE_RESTART_PHP}" 2>&1
 }
 
 #  Résumé d'une ligne (vide si rien) : « short » donne des compteurs (Santé),
@@ -1706,12 +1926,12 @@ _stale_summary() {
 #  services et démons de plugins, chacun après confirmation (jamais de reboot).
 #  Renvoie 0 si rien n'est à relancer, 1 sinon (avant relance éventuelle).
 _stale_check() {
-    local mode="${1:-interactive}" lines kind name u out pid1=0
-    local -a svc=() sens=() plug=() other=()
+    local mode="${1:-interactive}" lines kind name u out cur pid1=0
+    local -a svc=() svc1=() sens=() plug=() other=()
     lines=$(_stale_scan)
     while IFS='|' read -r kind name; do
         case "${kind}" in
-            service)  svc+=("${name}") ;;
+            service)  [[ "${name}" =~ ${_STALE_ONE_BY_ONE} ]] && svc1+=("${name}") || svc+=("${name}") ;;
             sensible) sens+=("${name}") ;;
             plugin)   plug+=("${name}") ;;
             systemd)  pid1=1 ;;
@@ -1723,39 +1943,61 @@ _stale_check() {
         echo -e "${G}✔ Aucun : tous les processus utilisent les bibliothèques à jour.${N}"
         return 0
     fi
-    [[ ${#svc[@]}   -gt 0 ]] && echo -e "${W}Services à relancer :${N} ${svc[*]}"
-    [[ ${#plug[@]}  -gt 0 ]] && echo -e "${W}Démons de plugins Jeedom :${N} ${plug[*]}"
-    [[ ${#sens[@]}  -gt 0 ]] && echo -e "${Y}Relance délicate (réseau, sessions), redémarrage de la box conseillé :${N} ${sens[*]}"
+    # Noms affichés avec printf %s, jamais echo -e (voir _stale_scan).
+    [[ ${#svc[@]}   -gt 0 ]] && printf '%b %s\n' "${W}Services à relancer :${N}" "${svc[*]}"
+    [[ ${#svc1[@]}  -gt 0 ]] && printf '%b %s\n' "${W}Services à relancer un par un (coupure de Jeedom ou des conteneurs) :${N}" "${svc1[*]}"
+    [[ ${#plug[@]}  -gt 0 ]] && printf '%b %s\n' "${W}Démons de plugins Jeedom :${N}" "${plug[*]}"
+    [[ ${#sens[@]}  -gt 0 ]] && printf '%b %s\n' "${Y}Relance délicate (réseau, sessions), redémarrage de la box conseillé :${N}" "${sens[*]}"
     [[ ${pid1} -eq 1 ]]      && echo -e "${Y}systemd (PID 1) :${N} systemctl daemon-reexec, ou redémarrage de la box"
-    [[ ${#other[@]} -gt 0 ]] && echo -e "${DIM}Autres processus sans service propre :${N} ${other[*]}"
+    [[ ${#other[@]} -gt 0 ]] && printf '%b %s\n' "${DIM}Autres processus sans service propre :${N}" "${other[*]}"
     echo -e "${DIM}Une mise à jour de sécurité ne protège un processus qu'après sa relance.${N}"
     [[ "${mode}" == interactive ]] || return 1
 
+    # La liste a pu changer pendant la lecture (hook apt, relance par Jeedom) :
+    # on ne relance que ce qui est encore concerné au moment d'agir.
     if [[ ${#svc[@]} -gt 0 ]]; then
         echo
-        if confirm "Relancer les ${#svc[@]} service(s)"; then
-            for u in "${svc[@]}"; do
-                if systemctl restart "${u}" 2>&1; then
-                    echo -e "  ${G}✔${N} ${u}"; log_action "relance ${u} (bibliothèques mises à jour)"
-                else
-                    echo -e "  ${R}✘${N} ${u}"; log_action "relance ${u} ÉCHEC"
-                fi
-            done
+        if confirm "Relancer les ${#svc[@]} service(s) ci-dessus"; then
+            cur=$(_stale_scan)
+            for u in "${svc[@]}"; do _stale_restart_unit "${u}" "${cur}"; done
         fi
     fi
+    for u in "${svc1[@]}"; do
+        echo
+        if confirm "Relancer ${u}"; then
+            _stale_restart_unit "${u}" "$(_stale_scan)"
+        fi
+    done
     if [[ ${#plug[@]} -gt 0 ]]; then
         echo
         if confirm "Relancer les démons de ${#plug[@]} plugin(s)"; then
+            cur=$(_stale_scan)
             for u in "${plug[@]}"; do
+                if ! grep -qxF "plugin|${u}" <<< "${cur}"; then
+                    printf '  %b %s\n' "${DIM}–${N}" "${u} : déjà à jour"; continue
+                fi
                 if out=$(_stale_restart_plugin "${u}"); then
-                    echo -e "  ${G}✔${N} ${u} (${out})"; log_action "relance démon ${u} (bibliothèques mises à jour)"
+                    printf '  %b %s\n' "${G}✔${N}" "${u} (${out})"; log_action "relance démon ${u} (bibliothèques mises à jour)"
                 else
-                    echo -e "  ${R}✘${N} ${u} : ${out}"; log_action "relance démon ${u} ÉCHEC : ${out}"
+                    printf '  %b %s\n' "${R}✘${N}" "${u} : ${out}"; log_action "relance démon ${u} ÉCHEC : ${out}"
                 fi
             done
         fi
     fi
     return 1
+}
+
+#  Relance un service s'il figure encore dans la liste $2 (sortie de _stale_scan).
+_stale_restart_unit() {
+    local u="$1" cur="$2"
+    if ! grep -qxF "service|${u}" <<< "${cur}"; then
+        printf '  %b %s\n' "${DIM}–${N}" "${u} : déjà à jour"; return 0
+    fi
+    if systemctl restart -- "${u}" 2>&1; then
+        printf '  %b %s\n' "${G}✔${N}" "${u}"; log_action "relance ${u} (bibliothèques mises à jour)"
+    else
+        printf '  %b %s\n' "${R}✘${N}" "${u}"; log_action "relance ${u} ÉCHEC"
+    fi
 }
 
 # ============================================================
@@ -1779,10 +2021,14 @@ _apt_hook_mode() {  # log|auto, ou rien si le hook n'est pas installé
 #  dpkg/apt en cours : leurs verrous POSIX apparaissent dans /proc/locks
 #  (« ... maj:min:inode ... »). Sans fuser/lsof, qui ne sont pas toujours là.
 _dpkg_busy() {
-    local f ino
+    local f st d id
     for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock; do
-        ino=$(stat -c %i "${f}" 2>/dev/null) || continue
-        grep -qE ":${ino} " /proc/locks && return 0
+        st=$(stat -c '%D %i' "${f}" 2>/dev/null) || continue
+        # /proc/locks écrit le périphérique en « majeur:mineur » hexadécimaux
+        # (%02x) ; stat -c %D le donne en un seul nombre (encodage new_encode_dev).
+        d=$((16#${st% *}))
+        printf -v id '%02x:%02x:%s' $(( (d >> 8) & 0xfff )) $(( (d & 0xff) | ((d >> 12) & 0xfff00) )) "${st#* }"
+        grep -qF " ${id} " /proc/locks && return 0
     done
     return 1
 }
@@ -1807,6 +2053,12 @@ _apt_hook_run() {
     local mode="$1" i kind name out summary msg
     local -a restarted=() failed=()
     for ((i = 0; i < 180; i++)); do _dpkg_busy || break; sleep 10; done
+    if [[ "${mode}" == auto ]] && _dpkg_busy; then
+        # Toujours en cours après 30 min : on signale seulement, sans relancer
+        # au milieu d'une installation.
+        log_action "apt-hook : dpkg toujours actif après 30 min, aucune relance automatique"
+        mode=log
+    fi
     if [[ "${mode}" == auto ]]; then
         while IFS='|' read -r kind name; do
             if [[ "${kind}" == service && "${name}" =~ ${_STALE_AUTO_SAFE} ]]; then
@@ -1817,7 +2069,7 @@ _apt_hook_run() {
                 if [[ "${name}" == nginx.service ]] && ! nginx -t >/dev/null 2>&1; then
                     failed+=("${name} (nginx -t en échec)"); continue
                 fi
-                if systemctl restart "${name}" >/dev/null 2>&1; then restarted+=("${name}"); else failed+=("${name}"); fi
+                if systemctl restart -- "${name}" >/dev/null 2>&1; then restarted+=("${name}"); else failed+=("${name}"); fi
             elif [[ "${kind}" == plugin ]]; then
                 if out=$(_stale_restart_plugin "${name}"); then restarted+=("${name}"); else failed+=("${name} (${out})"); fi
             fi
@@ -1870,7 +2122,7 @@ _apt_hook_setup() {
     { echo "// Installé par jeehelp (menu Mises à jour) : après chaque mise à jour, repère les"
       echo "// processus restés sur d'anciennes bibliothèques. Supprimer ce fichier pour désactiver."
       echo "DPkg::Post-Invoke { \"if [ -x ${SELF_PATH} ]; then ${SELF_PATH} --apt-hook ${mode} >/dev/null 2>&1 || true; fi\"; };"
-    } > "${APT_HOOK_FILE}.tmp" && mv "${APT_HOOK_FILE}.tmp" "${APT_HOOK_FILE}"
+    } > "${APT_HOOK_FILE}.tmp" && chmod 644 "${APT_HOOK_FILE}.tmp" && mv "${APT_HOOK_FILE}.tmp" "${APT_HOOK_FILE}"
     echo -e "${G}✔ Activée (${mode})${N} : ${APT_HOOK_FILE}"
     echo -e "\nAprès chaque mise à jour (apt, unattended-upgrades), jeehelp attend la fin d'apt,"
     echo -e "puis note le résultat dans ${AUDIT_LOG} et, s'il reste des processus à relancer,"
@@ -1883,7 +2135,7 @@ ${Y}MariaDB, SSH et les autres services restent seulement signalés.${N}"
 }
 
 # ============================================================
-#  8 — NETTOYAGE
+#  8 — NETTOYAGE DE /tmp (menu Maintenance)
 # ============================================================
 
 # Nettoyage ciblé de /tmp : exclut les sockets/verrous système partagés
@@ -1919,44 +2171,9 @@ _cleanup_tmp() {
     pause
 }
 
-menu_cleanup() {
-    local opts=(
-        "🗑️   Vieilles sauvegardes (> ${MAX_BACKUPS} jours)"
-        "🧹  Nettoyer /tmp"
-        "💿  Analyse espace disque"
-        "⚡  Vider OPcache PHP"
-        "📦  apt autoremove"
-        "↩  Retour"
-    )
-    while true; do
-        nav_menu "Nettoyage" "${opts[@]}"
-        case $MENU_RESULT in
-            -1|5) return ;;
-            0) header; section "Vieilles sauvegardes"
-               local found; found=$(find "${BACKUP_DIR}" -name "*.tar.gz" -mtime +${MAX_BACKUPS} 2>/dev/null)
-               if [[ -z "$found" ]]; then
-                   echo -e "${G}Rien à supprimer.${N}"
-               else
-                   echo "${found}"
-                   echo
-                   confirm "Supprimer ces fichiers" \
-                       && { find "${BACKUP_DIR}" -name "*.tar.gz" -mtime +${MAX_BACKUPS} -delete
-                            echo -e "${G}✔ Supprimés.${N}"; log_action "Old backups purged"; } \
-                       || echo -e "${Y}Annulé.${N}"
-               fi; pause ;;
-            1) _cleanup_tmp ;;
-            2) menu_disk ;;
-            3) header; section "OPcache PHP"
-               php -r "opcache_reset() ? print 'OPcache vidé.\n' : print 'OPcache N/A.\n';" 2>/dev/null
-               pause ;;
-            4) header; section "apt autoremove"
-               apt-get autoremove -y 2>&1; pause ;;
-        esac
-    done
-}
 
 # ============================================================
-#  8b — ANALYSE DE L'ESPACE DISQUE  (Nettoyage, --disk, rapport)
+#  8b — ANALYSE DE L'ESPACE DISQUE  (Diagnostic, --disk, rapport)
 # ============================================================
 #  But : nommer l'origine d'un disque plein, pas seulement son pourcentage.
 #  Une passe find|awk par système de fichiers (-xdev, nice/ionice) donne la
@@ -2144,7 +2361,7 @@ _dk_hint() {
         /var/crash|/var/crash/*|/var/lib/systemd/coredump|/var/lib/systemd/coredump/*)
             echo "Rapports de plantage (core dumps) : supprimables après analyse." ;;
         /tmp|/tmp/*|/var/tmp|/var/tmp/*)
-            echo "Fichiers temporaires : menu Nettoyage › Nettoyer /tmp." ;;
+            echo "Fichiers temporaires : menu Maintenance › Nettoyer /tmp." ;;
         /home|/home/*|/root|/root/*)
             echo "Fichiers personnels (copies de sauvegardes, téléchargements, exports)." ;;
         /boot|/boot/*)
@@ -3129,7 +3346,7 @@ declare -gA AI_ACTIONS=(
     [fix-perms]="--fix-perms|modification|Rétablir les droits fichiers (comme le bouton Jeedom)"
     [repair-db]="--repair-db|modification|REPAIR TABLE sur toutes les tables"
     [backup]="--backup|modification|Lancer une sauvegarde Jeedom"
-    [upgrade-security]="--upgrade-security|modification|Appliquer les mises à jour de sécurité Debian"
+    [upgrade-security]="--upgrade-security|modification|Appliquer les mises à jour de sécurité Debian (hook apt en mode auto : relance aussi Apache/PHP-FPM et les démons de plugins)"
     [restart-check]="--restart-check|lecture|Lister les services et démons restés sur d'anciennes bibliothèques"
 )
 
@@ -3631,7 +3848,7 @@ cli_mode() {
             rc=$? ;;
         --check)
             echo "[CLI] Vérification système..."
-            _H_OK=0; _H_WARN=0; _H_ERR=0
+            _H_OK=0; _H_WARN=0; _H_ERR=0; _H_PERM=0
             _watchdog_check; local wd_rc=$?
             _ssl_check_auto; local ssl_rc=$?
             [[ ${wd_rc} -ne 0 || ${ssl_rc} -ne 0 ]] && rc=1 ;;
@@ -3660,10 +3877,10 @@ cli_mode() {
         --restart-check)
             _stale_check cli
             rc=$? ;;
-        --apt-hook)  # appelé par dpkg (voir _apt_hook_setup), pas à la main
+        --apt-hook)  # interne, absent de l'aide : appelé par dpkg (voir _apt_hook_setup)
             _apt_hook "${2:-log}"
             exit 0 ;;
-        --apt-hook-run)  # lancé par le timer systemd posé par --apt-hook
+        --apt-hook-run)  # interne, absent de l'aide : lancé par le timer posé par --apt-hook
             _apt_hook_run "${2:-log}"
             rc=$? ;;
         *)
@@ -3675,7 +3892,7 @@ cli_mode() {
             echo "  --disk              Analyse de l'espace disque : origine, tailles et % par dossier (lecture seule)"
             echo "  --report            Rapport de diagnostic complet (code retour : 0 OK, 1 avertissement, 2 erreur)"
             echo "  --ask [options]     Analyse du rapport par IA (local d'abord) : --pick --provider ID --file F --channel auto|plugin|direct --with-logs --dry-run --include-invalid"
-            echo "  --download [N]               Liste les sauvegardes, ou envoie la N-ième (1 = dernière) sur stdout : ssh box "sudo jeehelp --download 1" > f.tar.gz"
+            echo "  --download [N]               Liste les sauvegardes, ou envoie la N-ième (1 = dernière) sur stdout : ssh box 'sudo jeehelp --download 1' > f.tar.gz"
             echo "  --self-update       Mettre jeehelp à jour depuis GitHub (--branch NOM, --yes)"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
@@ -3691,41 +3908,31 @@ cli_mode() {
 
 main_menu() {
     local opts=(
-        "📊  Informations système & watchdog"
-        "🏥  Santé générale & droits fichiers"
-        "🧰  Maintenance générale (droits + DB + cache)"
+        "🩺  Diagnostic (infos, santé, disque, rapport, IA)"
+        "🧰  Maintenance (droits, cache, nettoyage)"
         "💾  Sauvegardes"
         "🗄️   Base de données"
         "⚙️   Services & Jeedom"
         "📋  Logs & audit"
         "🌐  Réseau & SSL"
         "🔄  Mises à jour & sécurité"
-        "🧹  Nettoyage"
-        "📝  Générer un rapport de diagnostic"
-        "🤖  Analyser le rapport avec l'IA"
         "🆘  Mode secours (interface web injoignable)"
-        "⬆️   Mettre à jour jeehelp (GitHub)"
         "❌  Quitter"
     )
 
     while true; do
         nav_menu "Menu principal" "${opts[@]}"
         case $MENU_RESULT in
-            -1|14) _exit_clean ;;
-            0) show_system_info ;;
-            1) menu_health      ;;
-            2) maintenance_generale ;;
-            3) menu_backups     ;;
-            4) menu_database    ;;
-            5) menu_services    ;;
-            6) menu_logs        ;;
-            7) menu_network     ;;
-            8) menu_updates     ;;
-            9) menu_cleanup     ;;
-            10) menu_report     ;;
-            11) menu_ask        ;;
-            12) menu_rescue     ;;
-            13) menu_self_update ;;
+            -1|9) _exit_clean ;;
+            0) menu_diagnostic  ;;
+            1) menu_maintenance ;;
+            2) menu_backups     ;;
+            3) menu_database    ;;
+            4) menu_services    ;;
+            5) menu_logs        ;;
+            6) menu_network     ;;
+            7) menu_updates     ;;
+            8) menu_rescue      ;;
         esac
     done
 }
