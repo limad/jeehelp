@@ -9,6 +9,7 @@
 #               sudo bash jeedom-menu.sh --check
 #               sudo bash jeedom-menu.sh --disk
 #               sudo bash jeedom-menu.sh --upgrade-security
+#               sudo bash jeedom-menu.sh --restart-check
 # ============================================================
 
 # ── Constantes ───────────────────────────────────────────────
@@ -691,6 +692,12 @@ show_health() {
     else                                  _chk "Mises à jour sécurité" ok   "aucune"
     fi
 
+    # Processus restés sur d'anciennes bibliothèques (mise à jour faite, pas relancés).
+    local stale; stale=$(_stale_summary short)
+    [[ -n "${stale}" ]] \
+        && _chk "Processus à relancer" warn "${stale} (détail : jeehelp --restart-check)" \
+        || _chk "Processus à relancer" ok   "aucun"
+
     # ── Résumé ──
     echo
     echo -e "  ${B}────────────────────────────────────────────${N}"
@@ -1271,12 +1278,13 @@ menu_updates() {
         "🧪  Simuler les mises à jour de sécurité (sans rien appliquer)"
         "📊  Statut unattended-upgrades"
         "🛡️   Appliquer les mises à jour de sécurité maintenant"
+        "♻️   Processus à relancer après mise à jour"
         "↩  Retour"
     )
     while true; do
         nav_menu "Mises à jour & Sécurité" "${opts[@]}"
         case $MENU_RESULT in
-            -1|7) return ;;
+            -1|8) return ;;
             0) header; section "Vérification des mises à jour"
                # update::checkAllUpdate() + refreshUpdateMessage() = action
                # exacte de l'ajax core update.ajax.php?action=checkAllUpdate.
@@ -1309,11 +1317,13 @@ menu_updates() {
                    echo -e "\n${R}✘ Échec lors de la mise à jour système (update ou upgrade).${N}"
                    log_action "apt upgrade ÉCHEC"
                fi
+               echo; _stale_check interactive
                pause ;;
             3) _unattended_setup  ;;
             4) _unattended_dryrun ;;
             5) _unattended_status ;;
             6) _upgrade_security interactive ;;
+            7) header; _stale_check interactive; pause ;;
         esac
     done
 }
@@ -1429,8 +1439,149 @@ _upgrade_security() {
         fi
         log_action "upgrade-security (${mode}, repli apt-get upgrade --only-upgrade, rc=${rc})"
     fi
+    echo
+    _stale_check "${mode}"
     [[ "$mode" == "interactive" ]] && pause
     return $rc
+}
+
+# ============================================================
+#  Processus restés sur d'anciennes bibliothèques après une mise à jour
+# ============================================================
+#  Équivalent minimal de needrestart, sans dépendance. apt remplace les
+#  fichiers sur disque, mais un processus déjà lancé garde l'ancienne version
+#  en mémoire : /proc/<pid>/maps la marque alors « (deleted) ». Le correctif
+#  n'est réellement appliqué qu'après la relance du processus.
+#  Limite : seuls les binaires et bibliothèques sont vus, pas le code
+#  interprété (.py, .php) mis à jour.
+#
+#  Sortie de _stale_scan : une ligne par cible, sans doublon, « type|nom » :
+#    service|<unit>   service systemd à relancer (systemctl restart)
+#    sensible|<unit>  relance qui coupe réseau ou sessions : reboot conseillé
+#    plugin|<id>      démon d'un plugin Jeedom. Jeedom les lance sous le
+#                     cgroup de cron.service (KillMode=process) : relancer
+#                     cron ne les relance pas, il faut passer par Jeedom.
+#    systemd|1        PID 1 : systemctl daemon-reexec ou reboot
+#    process|<nom>    autre processus sans service propre
+#  Les sessions utilisateur (user.slice) sont ignorées : se reconnecter suffit.
+readonly _STALE_SENSITIVE='^(dbus|systemd-logind|NetworkManager|networking|systemd-networkd|wpa_supplicant|lightdm|gdm3?|sddm|display-manager|(serial-)?getty@.*|user@.*)\.service$'
+
+_stale_scan() {
+    local m pid cg unit cmd
+    local -A main=() km=()
+    for m in /proc/[0-9]*/maps; do
+        grep -qE ' /(usr/)?(lib|lib64|bin|sbin|libexec)/[^ ]* \(deleted\)$' "$m" 2>/dev/null || continue
+        pid=${m#/proc/}; pid=${pid%/maps}
+        [[ "${pid}" == 1 ]] && { echo "systemd|1"; continue; }
+        cg=$(grep -m1 '^0::' "/proc/${pid}/cgroup" 2>/dev/null); cg=${cg#0::}
+        [[ "${cg}" == /user.slice/* ]] && continue
+        cmd=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+        # Tâches du core relancées chaque minute (jeeCron...) : se renouvellent seules.
+        [[ "${cmd}" == *"${JEEDOM_DIR}/core/php/"* ]] && continue
+        if [[ "${cmd}" =~ ${JEEDOM_DIR}/plugins/([A-Za-z0-9_]+)/ ]]; then
+            echo "plugin|${BASH_REMATCH[1]}"; continue
+        fi
+        unit=$(grep -oE '[^/]+\.service' <<< "${cg}" | head -1)
+        if [[ "${cg}" == /system.slice/* && -n "${unit}" ]]; then
+            if [[ -z "${km[${unit}]+x}" ]]; then
+                km[${unit}]=$(systemctl show -p KillMode --value "${unit}" 2>/dev/null)
+                main[${unit}]=$(systemctl show -p MainPID --value "${unit}" 2>/dev/null)
+            fi
+            # KillMode=process : la relance ne touche que le processus
+            # principal, un enfant détaché resterait sur l'ancienne version.
+            if [[ "${km[${unit}]}" != process || "${main[${unit}]}" == "${pid}" ]]; then
+                [[ "${unit}" =~ ${_STALE_SENSITIVE} ]] && echo "sensible|${unit}" || echo "service|${unit}"
+                continue
+            fi
+        fi
+        echo "process|$(cat "/proc/${pid}/comm" 2>/dev/null) (pid ${pid})"
+    done | sort -u
+}
+
+#  Résumé d'une ligne (vide si rien) : « short » donne des compteurs (Santé),
+#  « full » la liste par catégorie (rapport).
+_stale_summary() {
+    local fmt="${1:-short}" lines
+    lines=$(_stale_scan)
+    [[ -z "${lines}" ]] && return 0
+    awk -F'|' -v fmt="${fmt}" '
+        { n[$1]++; l[$1] = l[$1] (l[$1] ? " " : "") $2 }
+        END {
+            split("service plugin sensible systemd process", o, " ")
+            lab["service"] = "service(s)"; lab["plugin"] = "démon(s) de plugin"
+            lab["sensible"] = "sensible(s) (reboot conseillé)"; lab["process"] = "autre(s)"
+            for (i = 1; i <= 5; i++) {
+                k = o[i]; if (!(k in n)) continue
+                if (k == "systemd")    t = "systemd (PID 1)"
+                else if (fmt == "short") t = n[k] " " lab[k]
+                else                   t = lab[k] " : " l[k]
+                out = out (out == "" ? "" : (fmt == "short" ? ", " : " ; ")) t
+            }
+            print out
+        }' <<< "${lines}"
+}
+
+#  Affiche les processus à relancer ; en mode interactif, propose de relancer
+#  services et démons de plugins, chacun après confirmation (jamais de reboot).
+#  Renvoie 0 si rien n'est à relancer, 1 sinon (avant relance éventuelle).
+_stale_check() {
+    local mode="${1:-interactive}" lines kind name u out pid1=0
+    local -a svc=() sens=() plug=() other=()
+    lines=$(_stale_scan)
+    while IFS='|' read -r kind name; do
+        case "${kind}" in
+            service)  svc+=("${name}") ;;
+            sensible) sens+=("${name}") ;;
+            plugin)   plug+=("${name}") ;;
+            systemd)  pid1=1 ;;
+            process)  other+=("${name}") ;;
+        esac
+    done <<< "${lines}"
+    section "Processus restés sur d'anciennes bibliothèques"
+    if [[ -z "${lines}" ]]; then
+        echo -e "${G}✔ Aucun : tous les processus utilisent les bibliothèques à jour.${N}"
+        return 0
+    fi
+    [[ ${#svc[@]}   -gt 0 ]] && echo -e "${W}Services à relancer :${N} ${svc[*]}"
+    [[ ${#plug[@]}  -gt 0 ]] && echo -e "${W}Démons de plugins Jeedom :${N} ${plug[*]}"
+    [[ ${#sens[@]}  -gt 0 ]] && echo -e "${Y}Relance délicate (réseau, sessions), redémarrage de la box conseillé :${N} ${sens[*]}"
+    [[ ${pid1} -eq 1 ]]      && echo -e "${Y}systemd (PID 1) :${N} systemctl daemon-reexec, ou redémarrage de la box"
+    [[ ${#other[@]} -gt 0 ]] && echo -e "${DIM}Autres processus sans service propre :${N} ${other[*]}"
+    echo -e "${DIM}Une mise à jour de sécurité ne protège un processus qu'après sa relance.${N}"
+    [[ "${mode}" == interactive ]] || return 1
+
+    if [[ ${#svc[@]} -gt 0 ]]; then
+        echo
+        if confirm "Relancer les ${#svc[@]} service(s)"; then
+            for u in "${svc[@]}"; do
+                if systemctl restart "${u}" 2>&1; then
+                    echo -e "  ${G}✔${N} ${u}"; log_action "relance ${u} (bibliothèques mises à jour)"
+                else
+                    echo -e "  ${R}✘${N} ${u}"; log_action "relance ${u} ÉCHEC"
+                fi
+            done
+        fi
+    fi
+    if [[ ${#plug[@]} -gt 0 ]]; then
+        echo
+        if confirm "Relancer les démons de ${#plug[@]} plugin(s)"; then
+            for u in "${plug[@]}"; do
+                out=$(_jee_php_env "JH_PLUGIN=${u}" '
+                    try {
+                        $p = plugin::byId(getenv("JH_PLUGIN"));
+                        if ($p->getHasOwnDeamon() != 1) { echo "pas de démon géré par Jeedom"; exit(1); }
+                        $p->deamon_start(true);
+                        echo "état : " . $p->deamon_info()["state"];
+                    } catch (Throwable $e) { echo $e->getMessage(); exit(1); }')
+                if [[ $? -eq 0 ]]; then
+                    echo -e "  ${G}✔${N} ${u} (${out})"; log_action "relance démon ${u} (bibliothèques mises à jour)"
+                else
+                    echo -e "  ${R}✘${N} ${u} : ${out}"; log_action "relance démon ${u} ÉCHEC : ${out}"
+                fi
+            done
+        fi
+    fi
+    return 1
 }
 
 # ============================================================
@@ -2570,6 +2721,8 @@ generate_report() {
     local nup; nup=$(apt list --upgradable 2>/dev/null | grep -c upgradable)
     [[ "${nup}" -gt 20 ]] && _r_item warn "Paquets à mettre à jour" "${nup}" || _r_item ok "Paquets à mettre à jour" "${nup}"
     [[ -f /var/run/reboot-required ]] && _r_item warn "Redémarrage requis" "oui (mise à jour noyau/libc)" || _r_item ok "Redémarrage requis" "non"
+    local stale; stale=$(_stale_summary full)
+    [[ -n "${stale}" ]] && _r_item warn "Processus sur d'anciennes bibliothèques" "${stale}" || _r_item ok "Processus sur d'anciennes bibliothèques" "aucun"
 
     # ── Actions récentes de jeehelp ──
     _r_sec "Actions récentes de jeehelp (audit et mode secours)"
@@ -2679,6 +2832,7 @@ declare -gA AI_ACTIONS=(
     [repair-db]="--repair-db|modification|REPAIR TABLE sur toutes les tables"
     [backup]="--backup|modification|Lancer une sauvegarde Jeedom"
     [upgrade-security]="--upgrade-security|modification|Appliquer les mises à jour de sécurité Debian"
+    [restart-check]="--restart-check|lecture|Lister les services et démons restés sur d'anciennes bibliothèques"
 )
 
 _ai_conf_get() {
@@ -3205,6 +3359,9 @@ cli_mode() {
             echo "[CLI] unattended-upgrade..."
             _upgrade_security cli
             rc=$? ;;
+        --restart-check)
+            _stale_check cli
+            rc=$? ;;
         *)
             echo "Usage: sudo bash $0 [option]"
             echo "  --backup            Lancer une sauvegarde"
@@ -3218,6 +3375,7 @@ cli_mode() {
             echo "  --self-update       Mettre jeehelp à jour depuis GitHub (--branch NOM, --yes)"
             echo "  --fix-perms         Rétablir les droits fichiers"
             echo "  --upgrade-security  unattended-upgrade"
+            echo "  --restart-check     Services et démons restés sur d'anciennes bibliothèques (code retour : 0 aucun, 1 à relancer)"
             exit 1 ;;
     esac
     exit $rc
