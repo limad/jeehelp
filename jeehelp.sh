@@ -734,7 +734,7 @@ show_health() {
     # (cf. « Rétablissement des droits »).
     if [[ -f "${LOG_DIR}/http.error" ]] \
         && grep -q 'fwrite(): Argument #1 (\$stream) must be of type resource' "${LOG_DIR}/http.error" 2>/dev/null; then
-        _chk "Droits (log PHP)" err "erreur fatale d'écriture détectée (fwrite/stream) : lancez « Rétablissement des droits »"
+        _chk "Droits (log PHP)" err "erreur fatale d'écriture détectée (fwrite/stream) : lancez Maintenance › Rétablir les droits"
     else
         _chk "Droits (log PHP)" ok "aucune erreur fatale d'écriture détectée"
     fi
@@ -788,7 +788,7 @@ show_health() {
 
     if [[ $_H_ERR -gt 0 || $_H_WARN -gt 0 ]]; then
         echo
-        echo -e "  ${Y}→  Pensez à utiliser « Rétablissement des droits »${N}"
+        echo -e "  ${Y}→  Pensez à utiliser Maintenance › Rétablir les droits${N}"
         echo -e "     ${Y}si des erreurs de permissions sont signalées.${N}"
     fi
     [[ "$mode" == "interactive" ]] && pause
@@ -937,20 +937,53 @@ _show_users() {
 }
 
 # Sous-menu santé
-menu_health() {
+
+# ============================================================
+#  MENUS DIAGNOSTIC & MAINTENANCE (regroupent des actions définies ailleurs)
+# ============================================================
+
+menu_diagnostic() {
     local opts=(
-        "🔍  Vérification générale (health check)"
-        "🔑  Rétablissement des droits fichiers/dossiers"
-        "👤  Lister les utilisateurs"
+        "📊  Informations système & watchdog"
+        "🏥  Contrôle de santé complet"
+        "💿  Analyse de l'espace disque"
+        "📝  Générer un rapport de diagnostic"
+        "🤖  Analyser le rapport avec l'IA"
         "↩  Retour"
     )
     while true; do
-        nav_menu "Santé & Droits" "${opts[@]}"
+        nav_menu "Diagnostic" "${opts[@]}"
         case $MENU_RESULT in
-            -1|3) return ;;
-            0) show_health      ;;
-            1) fix_permissions  ;;
-            2) _show_users      ;;
+            -1|5) return ;;
+            0) show_system_info ;;
+            1) show_health      ;;
+            2) menu_disk        ;;
+            3) menu_report      ;;
+            4) menu_ask         ;;
+        esac
+    done
+}
+
+menu_maintenance() {
+    local opts=(
+        "🧰  Maintenance générale (droits + base + cache, enchaînés)"
+        "🔑  Rétablir les droits fichiers/dossiers"
+        "🧹  Vider le cache Jeedom"
+        "⚡  Vider l'OPcache PHP"
+        "🗑️   Nettoyer /tmp"
+        "↩  Retour"
+    )
+    while true; do
+        nav_menu "Maintenance" "${opts[@]}"
+        case $MENU_RESULT in
+            -1|5) return ;;
+            0) maintenance_generale ;;
+            1) fix_permissions      ;;
+            2) _db_flush_cache      ;;
+            3) header; section "OPcache PHP"
+               php -r "opcache_reset() ? print 'OPcache vidé.\n' : print 'OPcache N/A.\n';" 2>/dev/null
+               pause ;;
+            4) _cleanup_tmp ;;
         esac
     done
 }
@@ -959,24 +992,42 @@ menu_health() {
 #  2 — SAUVEGARDES
 # ============================================================
 
+_backup_purge_old() {
+    header; section "Sauvegardes de plus de ${MAX_BACKUPS} jours"
+    local found; found=$(find "${BACKUP_DIR}" -name "*.tar.gz" -mtime +${MAX_BACKUPS} 2>/dev/null)
+    if [[ -z "$found" ]]; then
+        echo -e "${G}Rien à supprimer.${N}"
+    else
+        echo "${found}"
+        echo
+        confirm "Supprimer ces fichiers" \
+            && { find "${BACKUP_DIR}" -name "*.tar.gz" -mtime +${MAX_BACKUPS} -delete
+                 echo -e "${G}✔ Supprimés.${N}"; log_action "Old backups purged"; } \
+            || echo -e "${Y}Annulé.${N}"
+    fi
+    pause
+}
+
 menu_backups() {
     local opts=(
         "📋  Lister les sauvegardes"
         "➕  Créer une sauvegarde"
         "📤  Restaurer une sauvegarde"
         "🗑️   Supprimer une sauvegarde"
-        "🔄  Rotation (garder ${MAX_BACKUPS} dernières)"
+        "🔄  Rotation : garder les ${MAX_BACKUPS} dernières"
+        "🧽  Purger les sauvegardes de plus de ${MAX_BACKUPS} jours"
         "↩  Retour"
     )
     while true; do
         nav_menu "Sauvegardes" "${opts[@]}"
         case $MENU_RESULT in
-            -1|5) return ;;
+            -1|6) return ;;
             0) _backup_list    ;;
             1) _backup_create  ;;
             2) _backup_restore ;;
             3) _backup_delete  ;;
             4) _backup_rotate  ;;
+            5) _backup_purge_old ;;
         esac
     done
 }
@@ -1070,13 +1121,12 @@ menu_database() {
         "🔍  mysqlcheck complet (--auto-repair)"
         "💾  Dump SQL complet"
         "📥  Importer un dump"
-        "🧹  Vider le cache Jeedom"
         "↩  Retour"
     )
     while true; do
         nav_menu "Base de données" "${opts[@]}"
         case $MENU_RESULT in
-            -1|8) return ;;
+            -1|7) return ;;
             0) _db_all_tables "ANALYZE"   ;;
             1) _db_all_tables "REPAIR"    ;;
             2) _db_all_tables "OPTIMIZE"  ;;
@@ -1084,7 +1134,6 @@ menu_database() {
             4) _db_mysqlcheck             ;;
             5) _db_dump                   ;;
             6) _db_import                 ;;
-            7) _db_flush_cache            ;;
         esac
     done
 }
@@ -1299,15 +1348,16 @@ menu_services() {
         "📡  État des services"
         "🌐  Redémarrer Apache / Nginx"
         "🗄️   Redémarrer MariaDB"
-        "⚙️   Redémarrer daemon Jeedom (cron)"
+        "⚙️   Redémarrer le moteur cron de Jeedom"
         "🔄  Relancer Jeedom complet"
-        "💻  Reboot serveur"
+        "👤  Utilisateurs Jeedom"
+        "💻  Redémarrer le serveur (reboot)"
         "↩  Retour"
     )
     while true; do
         nav_menu "Services & Jeedom" "${opts[@]}"
         case $MENU_RESULT in
-            -1|6) return ;;
+            -1|7) return ;;
             0) _svc_status ;;
             1) header; section "Redémarrage Apache/Nginx"
                for s in apache2 nginx; do svc_ctl restart "$s"; done; pause ;;
@@ -1320,7 +1370,8 @@ menu_services() {
                         log_action "Jeedom restart (stop+start)"; echo -e "${G}✔${N}"; } \
                    || echo -e "${Y}Annulé.${N}"
                pause ;;
-            5) _server_reboot ;;
+            5) _show_users    ;;
+            6) _server_reboot ;;
         esac
     done
 }
@@ -1387,7 +1438,7 @@ menu_logs() {
         "👁️   Afficher un log (50 lignes)"
         "📡  Suivre un log en temps réel (tail -f)"
         "🗑️   Vider tous les logs"
-        "🔧  Journalctl système"
+        "🔧  Journal système (journalctl)"
         "📒  Journal des actions (audit)"
         "↩  Retour"
     )
@@ -1482,15 +1533,15 @@ menu_network() {
 
 menu_updates() {
     local opts=(
-        "🔍  Vérifier mises à jour Jeedom"
+        "🔍  Vérifier les mises à jour Jeedom"
         "⬆️   Mettre à jour Jeedom (core)"
-        "📦  apt update + upgrade"
-        "🔒  Configurer unattended-upgrades"
-        "🧪  Simuler les mises à jour de sécurité (sans rien appliquer)"
-        "📊  Statut unattended-upgrades"
+        "📦  Mettre à jour le système (apt update + upgrade)"
         "🛡️   Appliquer les mises à jour de sécurité maintenant"
         "♻️   Processus à relancer après mise à jour"
+        "🧽  Supprimer les paquets inutiles (apt autoremove)"
+        "🔒  Mises à jour de sécurité automatiques (unattended-upgrades)"
         "🔔  Vérification automatique après mise à jour (hook apt)"
+        "⬆️   Mettre à jour jeehelp (GitHub)"
         "↩  Retour"
     )
     while true; do
@@ -1531,12 +1582,31 @@ menu_updates() {
                fi
                echo; _stale_check interactive
                pause ;;
-            3) _unattended_setup  ;;
-            4) _unattended_dryrun ;;
-            5) _unattended_status ;;
-            6) _upgrade_security interactive ;;
-            7) header; _stale_check interactive; pause ;;
-            8) _apt_hook_setup ;;
+            3) _upgrade_security interactive ;;
+            4) header; _stale_check interactive; pause ;;
+            5) header; section "Paquets inutiles (apt autoremove)"
+               apt-get autoremove -y 2>&1; pause ;;
+            6) _unattended_menu ;;
+            7) _apt_hook_setup ;;
+            8) menu_self_update ;;
+        esac
+    done
+}
+
+_unattended_menu() {
+    local opts=(
+        "🔒  Installer et configurer"
+        "🧪  Simuler (sans rien appliquer)"
+        "📊  Statut et dernier journal"
+        "↩  Retour"
+    )
+    while true; do
+        nav_menu "Mises à jour de sécurité automatiques (unattended-upgrades)" "${opts[@]}"
+        case $MENU_RESULT in
+            -1|3) return ;;
+            0) _unattended_setup  ;;
+            1) _unattended_dryrun ;;
+            2) _unattended_status ;;
         esac
     done
 }
@@ -1929,7 +1999,7 @@ ${Y}MariaDB, SSH et les autres services restent seulement signalés.${N}"
 }
 
 # ============================================================
-#  8 — NETTOYAGE
+#  8 — NETTOYAGE DE /tmp (menu Maintenance)
 # ============================================================
 
 # Nettoyage ciblé de /tmp : exclut les sockets/verrous système partagés
@@ -1965,44 +2035,9 @@ _cleanup_tmp() {
     pause
 }
 
-menu_cleanup() {
-    local opts=(
-        "🗑️   Vieilles sauvegardes (> ${MAX_BACKUPS} jours)"
-        "🧹  Nettoyer /tmp"
-        "💿  Analyse espace disque"
-        "⚡  Vider OPcache PHP"
-        "📦  apt autoremove"
-        "↩  Retour"
-    )
-    while true; do
-        nav_menu "Nettoyage" "${opts[@]}"
-        case $MENU_RESULT in
-            -1|5) return ;;
-            0) header; section "Vieilles sauvegardes"
-               local found; found=$(find "${BACKUP_DIR}" -name "*.tar.gz" -mtime +${MAX_BACKUPS} 2>/dev/null)
-               if [[ -z "$found" ]]; then
-                   echo -e "${G}Rien à supprimer.${N}"
-               else
-                   echo "${found}"
-                   echo
-                   confirm "Supprimer ces fichiers" \
-                       && { find "${BACKUP_DIR}" -name "*.tar.gz" -mtime +${MAX_BACKUPS} -delete
-                            echo -e "${G}✔ Supprimés.${N}"; log_action "Old backups purged"; } \
-                       || echo -e "${Y}Annulé.${N}"
-               fi; pause ;;
-            1) _cleanup_tmp ;;
-            2) menu_disk ;;
-            3) header; section "OPcache PHP"
-               php -r "opcache_reset() ? print 'OPcache vidé.\n' : print 'OPcache N/A.\n';" 2>/dev/null
-               pause ;;
-            4) header; section "apt autoremove"
-               apt-get autoremove -y 2>&1; pause ;;
-        esac
-    done
-}
 
 # ============================================================
-#  8b — ANALYSE DE L'ESPACE DISQUE  (Nettoyage, --disk, rapport)
+#  8b — ANALYSE DE L'ESPACE DISQUE  (Diagnostic, --disk, rapport)
 # ============================================================
 #  But : nommer l'origine d'un disque plein, pas seulement son pourcentage.
 #  Une passe find|awk par système de fichiers (-xdev, nice/ionice) donne la
@@ -2190,7 +2225,7 @@ _dk_hint() {
         /var/crash|/var/crash/*|/var/lib/systemd/coredump|/var/lib/systemd/coredump/*)
             echo "Rapports de plantage (core dumps) : supprimables après analyse." ;;
         /tmp|/tmp/*|/var/tmp|/var/tmp/*)
-            echo "Fichiers temporaires : menu Nettoyage › Nettoyer /tmp." ;;
+            echo "Fichiers temporaires : menu Maintenance › Nettoyer /tmp." ;;
         /home|/home/*|/root|/root/*)
             echo "Fichiers personnels (copies de sauvegardes, téléchargements, exports)." ;;
         /boot|/boot/*)
@@ -3737,41 +3772,31 @@ cli_mode() {
 
 main_menu() {
     local opts=(
-        "📊  Informations système & watchdog"
-        "🏥  Santé générale & droits fichiers"
-        "🧰  Maintenance générale (droits + DB + cache)"
+        "🩺  Diagnostic (infos, santé, disque, rapport, IA)"
+        "🧰  Maintenance (droits, cache, nettoyage)"
         "💾  Sauvegardes"
         "🗄️   Base de données"
         "⚙️   Services & Jeedom"
         "📋  Logs & audit"
         "🌐  Réseau & SSL"
         "🔄  Mises à jour & sécurité"
-        "🧹  Nettoyage"
-        "📝  Générer un rapport de diagnostic"
-        "🤖  Analyser le rapport avec l'IA"
         "🆘  Mode secours (interface web injoignable)"
-        "⬆️   Mettre à jour jeehelp (GitHub)"
         "❌  Quitter"
     )
 
     while true; do
         nav_menu "Menu principal" "${opts[@]}"
         case $MENU_RESULT in
-            -1|14) _exit_clean ;;
-            0) show_system_info ;;
-            1) menu_health      ;;
-            2) maintenance_generale ;;
-            3) menu_backups     ;;
-            4) menu_database    ;;
-            5) menu_services    ;;
-            6) menu_logs        ;;
-            7) menu_network     ;;
-            8) menu_updates     ;;
-            9) menu_cleanup     ;;
-            10) menu_report     ;;
-            11) menu_ask        ;;
-            12) menu_rescue     ;;
-            13) menu_self_update ;;
+            -1|9) _exit_clean ;;
+            0) menu_diagnostic  ;;
+            1) menu_maintenance ;;
+            2) menu_backups     ;;
+            3) menu_database    ;;
+            4) menu_services    ;;
+            5) menu_logs        ;;
+            6) menu_network     ;;
+            7) menu_updates     ;;
+            8) menu_rescue      ;;
         esac
     done
 }
