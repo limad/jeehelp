@@ -1828,7 +1828,7 @@ readonly _STALE_SENSITIVE='^(dbus|systemd-logind|NetworkManager|networking|syste
 #  terminal), un id de plugin n'est retenu que si son dossier existe, un nom
 #  d'unité que s'il a la forme d'une unité systemd.
 _stale_scan() {
-    local m pid cg unit cmd comm
+    local m pid cg unit cmd comm plug
     local -A main=() km=()
     for m in /proc/[0-9]*/maps; do
         # Bibliothèques (.so) et exécutables seulement : un fichier de données
@@ -1846,8 +1846,13 @@ _stale_scan() {
         cmd=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
         # Tâches du core relancées chaque minute (jeeCron...) : se renouvellent seules.
         [[ "${cmd}" == *"${JEEDOM_DIR}/core/php/"* ]] && continue
-        if [[ "${cmd}" =~ ${JEEDOM_DIR}/plugins/([A-Za-z0-9_]+)/ && -d "${JEEDOM_DIR}/plugins/${BASH_REMATCH[1]}" ]]; then
-            echo "plugin|${BASH_REMATCH[1]}"; continue
+        # Plugin propriétaire = DERNIER chemin plugins/<id>/ existant : le premier
+        # peut n'être que l'interpréteur emprunté à un autre plugin (ex. démon
+        # de fiddler_ui lancé avec le venv Python de mitm_proxy).
+        plug=$(grep -oE "${JEEDOM_DIR}/plugins/[A-Za-z0-9_]+/" <<< "${cmd}" | tac \
+            | while read -r d; do [[ -d "${d}" ]] && { basename "${d}"; break; }; done)
+        if [[ -n "${plug}" ]]; then
+            echo "plugin|${plug}"; continue
         fi
         unit=$(grep -oE '[^/]+\.service' <<< "${cg}" | head -1)
         [[ "${unit}" =~ ^[A-Za-z0-9@._:\\-]+\.service$ ]] || unit=""
