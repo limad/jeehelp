@@ -4,7 +4,7 @@ Menu d'administration en ligne de commande pour une box Jeedom (Debian 11/12, Je
 Un seul script bash, sans dépendance externe, pensé pour l'entretien courant d'une installation
 Jeedom en SSH : sauvegardes, base de données, services, logs, réseau, mises à jour et sécurité.
 
-Navigation interactive : ↑↓ sélection, ENTRÉE valider, ÉCHAP retour, CTRL+C quitter.
+Navigation interactive : ↑↓ ou numéro de l'entrée pour choisir (0 = Retour/Quitter), ENTRÉE ouvrir, ÉCHAP retour, CTRL+C quitter.
 
 ![Menu principal de jeehelp](docs/menu.png)
 Chaque action sensible (restauration, suppression, reboot, mise à jour...) demande une

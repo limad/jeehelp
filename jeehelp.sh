@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 #  jeedom-menu.sh v3 — Menu d'administration Jeedom
-#  Navigation : ↑↓ sélection  ENTRÉE valider  ÉCHAP retour  CTRL+C quitter
+#  Navigation : ↑↓ ou numéro  ENTRÉE valider  ÉCHAP retour  CTRL+C quitter
 #  Debian 11/12, Jeedom >= 4.4
 #  Interactif : sudo bash jeedom-menu.sh
 #  CLI        : sudo bash jeedom-menu.sh --backup
@@ -146,26 +146,54 @@ read_key() {
 #  nav_menu "Titre du menu" label1 label2 ... labelN
 #  Le dernier label doit être l'item "retour/quitter".
 #  Résultat dans $MENU_RESULT (0-based) ; -1 si ESC.
+#
+#  Chaque entrée porte un numéro : taper ce numéro place la sélection dessus,
+#  Entrée l'ouvre (jamais d'ouverture sur le seul chiffre : certaines actions
+#  sont sensibles). La dernière entrée prend le 0 si c'est une sortie
+#  (« ↩ Retour/Annuler », « ❌ Quitter »), les autres sont numérotées 1..N.
+#  Les chiffres s'accumulent (1 puis 3 = 13) tant que le nombre existe ;
+#  sinon seul le dernier chiffre est gardé. Retour arrière efface, une
+#  flèche annule la saisie.
+
+#  Numéro de l'entrée $1 (0-based), selon $2 = index de la sortie (-1 si aucune).
+_nav_num() { [[ $1 -eq $2 ]] && echo 0 || echo $(( $1 + 1 )); }
+
+#  Index de l'entrée portant le numéro $1, ou rien s'il n'existe pas.
+#  $2 = nombre d'entrées, $3 = index de la sortie (-1 si aucune).
+_nav_index() {
+    local n="$1" total="$2" exit_idx="$3" last
+    [[ "${n}" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    n=$((10#${n}))
+    if [[ ${n} -eq 0 ]]; then
+        [[ ${exit_idx} -ge 0 ]] && echo "${exit_idx}" && return 0
+        return 1
+    fi
+    last=${total}; [[ ${exit_idx} -ge 0 ]] && last=$((total - 1))
+    [[ ${n} -le ${last} ]] && echo $((n - 1))
+}
 
 _draw_nav_menu() {
-    local title="$1" sel="$2"
-    shift 2
+    local title="$1" sel="$2" buf="$3" exit_idx="$4"
+    shift 4
     local -a opts=("$@")
-    local total=${#opts[@]}
+    local total=${#opts[@]} width num i
+    width=$(( exit_idx >= 0 ? total - 1 : total )); width=${#width}
 
     header
     section "$title"
 
     for i in "${!opts[@]}"; do
+        printf -v num '%*s' "${width}" "$(_nav_num "$i" "${exit_idx}")"
         if [[ $i -eq $sel ]]; then
-            echo -e "  ${C}▶${N} ${W}${opts[$i]}${N}"
+            echo -e "  ${C}▶${N} ${C}${num}.${N} ${W}${opts[$i]}${N}"
         else
-            echo -e "  ${DIM}  ${opts[$i]}${N}"
+            echo -e "  ${DIM}  ${num}. ${opts[$i]}${N}"
         fi
     done
 
     echo
-    echo -e "  ${DIM}↑↓ naviguer  ↵ sélectionner  Échap retour  Ctrl+C quitter${N}"
+    echo -e "  ${DIM}↑↓ ou numéro : choisir  ↵ ouvrir  Échap retour  Ctrl+C quitter${N}"
+    [[ -n "${buf}" ]] && echo -e "  ${W}Choix : ${buf}${N}"
 }
 
 nav_menu() {
@@ -173,12 +201,14 @@ nav_menu() {
     shift
     local -a opts=("$@")
     local total=${#opts[@]}
-    local sel=0
+    local sel=0 buf="" exit_idx=-1 idx
+
+    [[ "${opts[$((total - 1))]}" =~ ^(↩|❌) ]] && exit_idx=$((total - 1))
 
     _cursor_hide
 
     while true; do
-        _draw_nav_menu "$title" "$sel" "${opts[@]}"
+        _draw_nav_menu "$title" "$sel" "$buf" "$exit_idx" "${opts[@]}"
         read_key
 
         case "$KEY_RESULT" in
@@ -186,13 +216,29 @@ nav_menu() {
                 # Affectation arithmétique (jamais un post-/pré-incrément ((…))) :
                 # ((sel++)) renvoie la valeur AVANT incrément comme statut de sortie,
                 # donc un sel=0 fait échouer le && et déclenche aussi le || qui suit.
+                buf=""
                 [[ $sel -gt 0 ]] && sel=$((sel - 1)) || sel=$((total - 1))
                 ;;
             down)
+                buf=""
                 [[ $sel -lt $((total - 1)) ]] && sel=$((sel + 1)) || sel=0
                 ;;
-            pgup) sel=0 ;;
-            pgdn) sel=$((total - 1)) ;;
+            pgup) buf=""; sel=0 ;;
+            pgdn) buf=""; sel=$((total - 1)) ;;
+            [0-9])
+                if idx=$(_nav_index "${buf}${KEY_RESULT}" "$total" "$exit_idx"); then
+                    buf="${buf}${KEY_RESULT}"
+                elif idx=$(_nav_index "${KEY_RESULT}" "$total" "$exit_idx"); then
+                    buf="${KEY_RESULT}"
+                else
+                    buf=""; idx=""
+                fi
+                [[ -n "${idx}" ]] && sel=${idx}
+                ;;
+            $'\x7f'|$'\b')  # Retour arrière
+                buf="${buf%?}"
+                [[ -n "${buf}" ]] && idx=$(_nav_index "${buf}" "$total" "$exit_idx") && sel=${idx}
+                ;;
             enter)
                 _cursor_show
                 MENU_RESULT=$sel
