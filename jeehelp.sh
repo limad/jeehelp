@@ -980,12 +980,43 @@ menu_maintenance() {
             0) maintenance_generale ;;
             1) fix_permissions      ;;
             2) _db_flush_cache      ;;
-            3) header; section "OPcache PHP"
-               php -r "opcache_reset() ? print 'OPcache vidé.\n' : print 'OPcache N/A.\n';" 2>/dev/null
-               pause ;;
+            3) _opcache_reset ;;
             4) _cleanup_tmp ;;
         esac
     done
+}
+
+#  Vide l'OPcache du PHP servi par le web. Un « php -r opcache_reset() » ne
+#  vide que le cache du PHP en ligne de commande (propre à ce processus), pas
+#  celui d'Apache ou de PHP-FPM, seul utilisé par Jeedom. Un rechargement en
+#  douceur (systemctl reload) réinitialise ce cache sans couper les requêtes
+#  en cours : vérifié avec mod_php (date de démarrage du cache renouvelée).
+_opcache_reset() {
+    header; section "Vider l'OPcache PHP (serveur web)"
+    local done=0 u
+    if systemctl is-active --quiet apache2 && compgen -G "/etc/apache2/mods-enabled/php*.load" >/dev/null; then
+        if ! apache2ctl configtest >/dev/null 2>&1; then
+            echo -e "${R}✘ Configuration Apache invalide (apache2ctl configtest) : rechargement annulé.${N}"
+        elif systemctl reload apache2; then
+            echo -e "${G}✔${N} Apache (mod_php) rechargé : OPcache vidé."; done=1
+        else
+            echo -e "${R}✘${N} Échec du rechargement d'Apache."
+        fi
+    fi
+    for u in $(systemctl list-units --type=service --state=active --no-legend --plain 'php*-fpm.service' 2>/dev/null | awk '{print $1}'); do
+        if systemctl reload "${u}"; then
+            echo -e "${G}✔${N} ${u} rechargé : OPcache vidé."; done=1
+        else
+            echo -e "${R}✘${N} Échec du rechargement de ${u}."
+        fi
+    done
+    if [[ ${done} -eq 1 ]]; then
+        echo -e "${DIM}Rechargement en douceur : aucune requête en cours n'est coupée.${N}"
+        log_action "OPcache vidé (rechargement du PHP web)"
+    else
+        echo -e "${Y}Aucun PHP servi par le web n'a été rechargé (ni Apache avec mod_php, ni PHP-FPM actif).${N}"
+    fi
+    pause
 }
 
 # ============================================================

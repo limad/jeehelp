@@ -56,7 +56,7 @@ message d'erreur si lancé sans `sudo`) et détecte Jeedom dans `/var/www/html`.
 | Section | Contenu |
 |---|---|
 | 🩺 Diagnostic | Informations système & watchdog (OS, uptime, charge, RAM, disque, version Jeedom), contrôle de santé complet (PHP, MariaDB, services, daemon, disque, RAM, CPU, dernière sauvegarde, permissions, logs d'erreurs, SSL, mises à jour apt, processus à relancer), analyse de l'espace disque, rapport de diagnostic, analyse du rapport par IA (détails ci-dessous) |
-| 🧰 Maintenance | Maintenance générale (droits + vérification/réparation de la base + cache, enchaînés), rétablissement des droits fichiers, vidage du cache Jeedom et de l'OPcache PHP, nettoyage de `/tmp` (avec aperçu et confirmation) |
+| 🧰 Maintenance | Maintenance générale (droits + vérification/réparation de la base + cache, enchaînés), rétablissement des droits fichiers, vidage du cache Jeedom, vidage de l'OPcache du PHP servi par le web (rechargement en douceur d'Apache avec mod_php et de PHP-FPM, sans coupure), nettoyage de `/tmp` (avec aperçu et confirmation) |
 | 💾 Sauvegardes | Lister, créer, restaurer, supprimer, rotation (conserve les 3 dernières), purge des sauvegardes de plus de 3 jours |
 | 🗄️ Base de données | ANALYZE / REPAIR / OPTIMIZE table par table, taille des tables, `mysqlcheck --auto-repair`, dump SQL complet, import d'un dump |
 | ⚙️ Services & Jeedom | État des services, redémarrage Apache/Nginx, MariaDB, moteur cron de Jeedom, relance complète de Jeedom, utilisateurs Jeedom, redémarrage du serveur |
