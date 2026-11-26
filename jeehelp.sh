@@ -1279,12 +1279,13 @@ menu_updates() {
         "📊  Statut unattended-upgrades"
         "🛡️   Appliquer les mises à jour de sécurité maintenant"
         "♻️   Processus à relancer après mise à jour"
+        "🔔  Vérification automatique après mise à jour (hook apt)"
         "↩  Retour"
     )
     while true; do
         nav_menu "Mises à jour & Sécurité" "${opts[@]}"
         case $MENU_RESULT in
-            -1|8) return ;;
+            -1|9) return ;;
             0) header; section "Vérification des mises à jour"
                # update::checkAllUpdate() + refreshUpdateMessage() = action
                # exacte de l'ajax core update.ajax.php?action=checkAllUpdate.
@@ -1324,6 +1325,7 @@ menu_updates() {
             5) _unattended_status ;;
             6) _upgrade_security interactive ;;
             7) header; _stale_check interactive; pause ;;
+            8) _apt_hook_setup ;;
         esac
     done
 }
@@ -1383,6 +1385,8 @@ _unattended_setup() {
             echo -e "\n${G}✔ Configuré — sans redémarrage automatique (un redémarrage manuel reste nécessaire après une mise à jour du noyau).${N}"
         fi
         log_action "unattended-upgrades configuré"
+        [[ -z "$(_apt_hook_mode)" ]] && echo -e "${DIM}Conseil : Mises à jour › Vérification automatique après mise à jour signale les services
+restés sur l'ancienne version après les mises à jour faites la nuit.${N}"
     else
         echo -e "\n${R}✘ Configuration incomplète — voir les échecs ci-dessus.${N}"
         log_action "unattended-upgrades configuré avec erreurs"
@@ -1498,6 +1502,18 @@ _stale_scan() {
     done | sort -u
 }
 
+#  Relance le démon d'un plugin par Jeedom (deamon_start forcé). Affiche
+#  l'état obtenu ou l'erreur ; code retour 0 si relancé.
+_stale_restart_plugin() {
+    _jee_php_env "JH_PLUGIN=$1" '
+        try {
+            $p = plugin::byId(getenv("JH_PLUGIN"));
+            if ($p->getHasOwnDeamon() != 1) { echo "pas de démon géré par Jeedom"; exit(1); }
+            $p->deamon_start(true);
+            echo "état : " . $p->deamon_info()["state"];
+        } catch (Throwable $e) { echo $e->getMessage(); exit(1); }'
+}
+
 #  Résumé d'une ligne (vide si rien) : « short » donne des compteurs (Santé),
 #  « full » la liste par catégorie (rapport).
 _stale_summary() {
@@ -1566,14 +1582,7 @@ _stale_check() {
         echo
         if confirm "Relancer les démons de ${#plug[@]} plugin(s)"; then
             for u in "${plug[@]}"; do
-                out=$(_jee_php_env "JH_PLUGIN=${u}" '
-                    try {
-                        $p = plugin::byId(getenv("JH_PLUGIN"));
-                        if ($p->getHasOwnDeamon() != 1) { echo "pas de démon géré par Jeedom"; exit(1); }
-                        $p->deamon_start(true);
-                        echo "état : " . $p->deamon_info()["state"];
-                    } catch (Throwable $e) { echo $e->getMessage(); exit(1); }')
-                if [[ $? -eq 0 ]]; then
+                if out=$(_stale_restart_plugin "${u}"); then
                     echo -e "  ${G}✔${N} ${u} (${out})"; log_action "relance démon ${u} (bibliothèques mises à jour)"
                 else
                     echo -e "  ${R}✘${N} ${u} : ${out}"; log_action "relance démon ${u} ÉCHEC : ${out}"
@@ -1582,6 +1591,130 @@ _stale_check() {
         fi
     fi
     return 1
+}
+
+# ============================================================
+#  Hook apt : vérification après chaque mise à jour, y compris nocturne
+# ============================================================
+#  unattended-upgrades installe en tâche de fond : sans ce hook, personne ne
+#  voit les services restés sur l'ancienne version. Le fichier APT_HOOK_FILE
+#  fait appeler « jeehelp --apt-hook <mode> » par dpkg après chaque passage.
+#  Modes : log  = journal jeehelp + message dans le centre de messages Jeedom
+#          auto = idem, après relance des seuls services sûrs (Apache, Nginx,
+#                 PHP-FPM) et des démons de plugins Jeedom. MariaDB, SSH et
+#                 les autres restent signalés, jamais relancés sans l'admin.
+readonly APT_HOOK_FILE="/etc/apt/apt.conf.d/99jeehelp-restart-check"
+readonly _STALE_AUTO_SAFE='^(apache2|nginx|php[0-9.]*-fpm)\.service$'
+
+_apt_hook_mode() {  # log|auto, ou rien si le hook n'est pas installé
+    [[ -f "${APT_HOOK_FILE}" ]] || return 0
+    grep -oE -- '--apt-hook (log|auto)' "${APT_HOOK_FILE}" | head -1 | cut -d' ' -f2
+}
+
+#  dpkg/apt en cours : leurs verrous POSIX apparaissent dans /proc/locks
+#  (« ... maj:min:inode ... »). Sans fuser/lsof, qui ne sont pas toujours là.
+_dpkg_busy() {
+    local f ino
+    for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock; do
+        ino=$(stat -c %i "${f}" 2>/dev/null) || continue
+        grep -qE ":${ino} " /proc/locks && return 0
+    done
+    return 1
+}
+
+#  Appelé par dpkg : doit rendre la main tout de suite. La vérification part
+#  dans un timer systemd transitoire, hors du cgroup d'apt-daily-upgrade.service
+#  (qui tuerait un simple processus en arrière-plan à sa fin). Le nom d'unité
+#  fixe sert de verrou : dpkg est appelé plusieurs fois par mise à jour, une
+#  seule vérification part.
+_apt_hook() {
+    local mode="$1"
+    [[ "${mode}" == auto ]] || mode=log
+    systemd-run --quiet --no-block --collect --unit=jeehelp-restart-check \
+        --on-active=60 --timer-property=AccuracySec=5s --timer-property=RemainAfterElapse=no \
+        "${_SELF}" --apt-hook-run "${mode}" >/dev/null 2>&1
+    return 0
+}
+
+#  Vérification lancée par le timer, une fois apt/dpkg terminés (30 min max).
+#  Remplace le message Jeedom précédent ; l'efface s'il n'y a plus rien.
+_apt_hook_run() {
+    local mode="$1" i kind name out summary msg
+    local -a restarted=() failed=()
+    for ((i = 0; i < 180; i++)); do _dpkg_busy || break; sleep 10; done
+    if [[ "${mode}" == auto ]]; then
+        while IFS='|' read -r kind name; do
+            if [[ "${kind}" == service && "${name}" =~ ${_STALE_AUTO_SAFE} ]]; then
+                # Config invalide = Apache/Nginx ne redémarrerait pas : on laisse tourner.
+                if [[ "${name}" == apache2.service ]] && ! apache2ctl configtest >/dev/null 2>&1; then
+                    failed+=("${name} (apache2ctl configtest en échec)"); continue
+                fi
+                if [[ "${name}" == nginx.service ]] && ! nginx -t >/dev/null 2>&1; then
+                    failed+=("${name} (nginx -t en échec)"); continue
+                fi
+                if systemctl restart "${name}" >/dev/null 2>&1; then restarted+=("${name}"); else failed+=("${name}"); fi
+            elif [[ "${kind}" == plugin ]]; then
+                if out=$(_stale_restart_plugin "${name}"); then restarted+=("${name}"); else failed+=("${name} (${out})"); fi
+            fi
+        done < <(_stale_scan)
+        [[ ${#restarted[@]} -gt 0 ]] && log_action "apt-hook : relancés automatiquement : ${restarted[*]}"
+        [[ ${#failed[@]}    -gt 0 ]] && log_action "apt-hook : échec de relance : ${failed[*]}"
+    fi
+    summary=$(_stale_summary full)
+    _jee_php 'message::removeAll("jeehelp", "restart-check");' >/dev/null
+    if [[ -z "${summary}" ]]; then
+        log_action "apt-hook (${mode}) : aucun processus à relancer"
+        return 0
+    fi
+    log_action "apt-hook (${mode}) : à relancer : ${summary}"
+    msg="Après une mise à jour, des processus utilisent encore d'anciennes bibliothèques : le correctif ne les protège qu'après relance. ${summary}. Pour les relancer : sudo jeehelp, menu Mises à jour, Processus à relancer."
+    [[ ${#restarted[@]} -gt 0 ]] && msg="Relancés automatiquement : ${restarted[*]}. ${msg}"
+    _jee_php_env "JH_MSG=${msg}" 'message::add("jeehelp", getenv("JH_MSG"), "", "restart-check");' >/dev/null
+    return 1
+}
+
+_apt_hook_setup() {
+    local cur mode
+    cur=$(_apt_hook_mode)
+    local -a opts=(
+        "Désactivée"
+        "Signaler seulement (journal jeehelp + message dans Jeedom)"
+        "Signaler, et relancer Apache/Nginx, PHP-FPM et les démons de plugins"
+        "↩  Retour"
+    )
+    case "${cur}" in
+        "")   opts[0]+="   ✔ actuel" ;;
+        log)  opts[1]+="   ✔ actuel" ;;
+        auto) opts[2]+="   ✔ actuel" ;;
+    esac
+    nav_menu "Vérification automatique après mise à jour (hook apt)" "${opts[@]}"
+    case $MENU_RESULT in
+        -1|3) return ;;
+        0) mode="" ;;
+        1) mode=log ;;
+        2) mode=auto ;;
+    esac
+    header; section "Vérification automatique après mise à jour"
+    if [[ -z "${mode}" ]]; then
+        rm -f "${APT_HOOK_FILE}"
+        echo -e "${G}✔ Désactivée${N} (${APT_HOOK_FILE} supprimé)."
+        log_action "hook apt désactivé"
+        pause; return
+    fi
+    # Pas de guillemet double possible dans une chaîne apt.conf.
+    { echo "// Installé par jeehelp (menu Mises à jour) : après chaque mise à jour, repère les"
+      echo "// processus restés sur d'anciennes bibliothèques. Supprimer ce fichier pour désactiver."
+      echo "DPkg::Post-Invoke { \"if [ -x ${SELF_PATH} ]; then ${SELF_PATH} --apt-hook ${mode} >/dev/null 2>&1 || true; fi\"; };"
+    } > "${APT_HOOK_FILE}.tmp" && mv "${APT_HOOK_FILE}.tmp" "${APT_HOOK_FILE}"
+    echo -e "${G}✔ Activée (${mode})${N} : ${APT_HOOK_FILE}"
+    echo -e "\nAprès chaque mise à jour (apt, unattended-upgrades), jeehelp attend la fin d'apt,"
+    echo -e "puis note le résultat dans ${AUDIT_LOG} et, s'il reste des processus à relancer,"
+    echo -e "dans le centre de messages de Jeedom."
+    [[ "${mode}" == auto ]] && echo -e "Apache/Nginx, PHP-FPM et les démons de plugins sont relancés automatiquement ;
+${Y}MariaDB, SSH et les autres services restent seulement signalés.${N}"
+    [[ -x "${SELF_PATH}" ]] || echo -e "\n${Y}⚠ jeehelp n'est pas installé dans ${SELF_PATH} : le hook ne fera rien (sudo bash install.sh).${N}"
+    log_action "hook apt activé (${mode})"
+    pause
 }
 
 # ============================================================
@@ -3361,6 +3494,12 @@ cli_mode() {
             rc=$? ;;
         --restart-check)
             _stale_check cli
+            rc=$? ;;
+        --apt-hook)  # appelé par dpkg (voir _apt_hook_setup), pas à la main
+            _apt_hook "${2:-log}"
+            exit 0 ;;
+        --apt-hook-run)  # lancé par le timer systemd posé par --apt-hook
+            _apt_hook_run "${2:-log}"
             rc=$? ;;
         *)
             echo "Usage: sudo bash $0 [option]"
